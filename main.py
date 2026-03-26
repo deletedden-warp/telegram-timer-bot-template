@@ -5,6 +5,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
+# Токен берётся из переменной окружения BOT_TOKEN
 TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
@@ -14,6 +15,7 @@ user_tasks = {}
 task_id_counter = 1
 user_state = {}
 
+# Кнопки выбора типа задачи
 def type_kb():
     kb = InlineKeyboardMarkup()
     kb.add(
@@ -22,18 +24,21 @@ def type_kb():
     )
     return kb
 
+# Кнопки для выбора дней
 def days_kb():
     kb = InlineKeyboardMarkup(row_width=5)
     for i in range(1, 31):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"day:{i}"))
     return kb
 
+# Кнопки для выбора часов
 def hours_kb():
     kb = InlineKeyboardMarkup(row_width=6)
     for i in range(1, 24):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"hour:{i}"))
     return kb
 
+# Кнопка удаления
 def control_kb(task_id):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("❌ Удалить", callback_data=f"del:{task_id}"))
@@ -42,6 +47,7 @@ def control_kb(task_id):
 @dp.message_handler(commands=["create"])
 async def create(message: types.Message):
     if len(user_tasks.get(message.from_user.id, [])) >= 2:
+        await message.answer("У тебя уже 2 активные записи!")
         await message.delete()
         return
     await message.delete()
@@ -120,7 +126,7 @@ async def delete_task(callback: types.CallbackQuery):
 
 async def updater():
     while True:
-        await asyncio.sleep(7200)
+        await asyncio.sleep(7200)  # каждые 2 часа
         now = datetime.utcnow()
         for task_id in list(tasks.keys()):
             task = tasks[task_id]

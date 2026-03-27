@@ -67,9 +67,15 @@ class SetNick(StatesGroup):
 # ================= UI =================
 
 def menu_kb():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("➕ Создать", "📋 Мои записи")
-    kb.add("❌ Удалить все", "✏️ Изменить ник")
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("➕ Создать", callback_data="menu_create"),
+        InlineKeyboardButton("📋 Мои записи", callback_data="menu_my")
+    )
+    kb.add(
+        InlineKeyboardButton("❌ Удалить все", callback_data="menu_del"),
+        InlineKeyboardButton("✏️ Изменить ник", callback_data="menu_nick")
+    )
     return kb
 
 def type_kb():
@@ -121,23 +127,21 @@ async def get_nick(user_id):
 async def menu(msg: types.Message):
     await msg.answer("Меню:", reply_markup=menu_kb())
 
-# ================= BUTTON HANDLERS =================
+@dp.callback_query_handler(lambda c: c.data.startswith("menu"))
+async def menu_actions(c: CallbackQuery, state: FSMContext):
+    await c.answer()
 
-@dp.message_handler(lambda m: m.text == "➕ Создать")
-async def btn_create(msg: types.Message):
-    await create_cmd(msg)
+    if c.data == "menu_create":
+        await create_cmd(c.message, state)
 
-@dp.message_handler(lambda m: m.text == "📋 Мои записи")
-async def btn_my(msg: types.Message):
-    await my(msg)
+    elif c.data == "menu_my":
+        await my(c.message)
 
-@dp.message_handler(lambda m: m.text == "❌ Удалить все")
-async def btn_del_all(msg: types.Message):
-    await del_all(msg)
+    elif c.data == "menu_del":
+        await del_all(c.message)
 
-@dp.message_handler(lambda m: m.text == "✏️ Изменить ник")
-async def btn_edit_nick(msg: types.Message):
-    await edit_nick(msg)
+    elif c.data == "menu_nick":
+        await edit_nick(c.message)
 
 # ================= CREATE =================
 
@@ -166,7 +170,6 @@ async def create_cmd(msg: types.Message, state: FSMContext):
 
 # ================= EDIT NICK =================
 
-@dp.message_handler(commands=["edit_nick"])
 async def edit_nick(msg: types.Message):
     await msg.answer("Введи новый ник:")
     await SetNick.nick.set()
@@ -186,7 +189,6 @@ async def save_nick(msg: types.Message, state: FSMContext):
 
 # ================= MY =================
 
-@dp.message_handler(commands=["my"])
 async def my(msg: types.Message):
     cursor.execute("SELECT name,type,hours_left FROM tasks WHERE user_id=%s",
                    (msg.from_user.id,))
@@ -200,7 +202,6 @@ async def my(msg: types.Message):
 
 # ================= DELETE ALL =================
 
-@dp.message_handler(commands=["delete_all"])
 async def del_all(msg: types.Message):
     cursor.execute("SELECT chat_id,message_id FROM tasks WHERE user_id=%s",
                    (msg.from_user.id,))
@@ -212,7 +213,7 @@ async def del_all(msg: types.Message):
 
     await msg.answer("Удалено ✅")
 
-# ================= CALLBACK FLOW =================
+# ================= FLOW =================
 
 @dp.callback_query_handler(lambda c: c.data in ["build", "research"], state=CreateTask.type)
 async def type_cb(c: CallbackQuery, state: FSMContext):

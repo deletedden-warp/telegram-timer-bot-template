@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     hours_left INTEGER,
     delete_at TIMESTAMP,
     chat_id BIGINT,
-    message_id BIGINT
+    message_id BIGINT,
+    thread_id BIGINT
 )
 """)
 
@@ -73,7 +74,10 @@ def menu_kb():
         InlineKeyboardButton("📋 Мои записи", callback_data="menu_my"),
     )
     kb.add(
+        InlineKeyboardButton("📊 Все записи", callback_data="menu_all"),
         InlineKeyboardButton("❌ Удалить все", callback_data="menu_del"),
+    )
+    kb.add(
         InlineKeyboardButton("✏️ Изменить ник", callback_data="menu_nick"),
     )
     return kb
@@ -121,17 +125,23 @@ async def get_nick(user_id):
     r = cursor.fetchone()
     return r[0] if r else None
 
+def progress_bar(percent):
+    total = 10
+    filled = int(percent / 10)
+    return "█" * filled + "░" * (total - filled)
+
 # ================= MENU =================
 
 @dp.message_handler(commands=["menu"])
 async def menu(msg: types.Message, state: FSMContext):
-    await state.finish()  # сброс зависших состояний
+    await state.finish()
     await delete_safe(msg.chat.id, msg.message_id)
 
     await bot.send_message(
         msg.chat.id,
         "📋 Меню управления:",
-        reply_markup=menu_kb()
+        reply_markup=menu_kb(),
+        message_thread_id=msg.message_thread_id
     )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("menu"))
@@ -143,6 +153,9 @@ async def menu_actions(c: CallbackQuery, state: FSMContext):
 
     elif c.data == "menu_my":
         await my(c.message)
+
+    elif c.data == "menu_all":
+        await all_tasks(c.message)
 
     elif c.data == "menu_del":
         await del_all(c.message)
@@ -162,6 +175,7 @@ async def create_cmd(msg: types.Message, state: FSMContext):
         return await msg.answer("У тебя уже 2 записи")
 
     nick = await get_nick(msg.from_user.id)
+
     if not nick:
         m = await msg.answer("Введи ник:")
         await state.update_data(msgs=[m.message_id])
@@ -172,7 +186,7 @@ async def create_cmd(msg: types.Message, state: FSMContext):
     await state.update_data(msgs=[m.message_id])
     await CreateTask.type.set()
 
-# ================= EDIT NICK =================
+# ================= NICK =================
 
 async def edit_nick(msg: types.Message):
     await msg.answer("Введи новый ник:")
@@ -186,9 +200,9 @@ async def save_nick(msg: types.Message, state: FSMContext):
     INSERT INTO users (user_id, nickname)
     VALUES (%s, %s)
     ON CONFLICT (user_id) DO UPDATE SET nickname = EXCLUDED.nickname
-    """, (msg.from_user.id, msg.text))
+    """, (msg.from_user.id, msg.text.strip()))
 
-    await msg.answer("Ник обновлён ✅")
+    await msg.answer("Ник сохранён ✅")
     await state.finish()
 
 # ================= MY =================
@@ -204,7 +218,29 @@ async def my(msg: types.Message):
     text = "\n".join([f"{n} | {t} | {h//24}д {h%24}ч" for n,t,h in rows])
     await msg.answer(text)
 
-# ================= DELETE ALL =================
+# ================= ALL =================
+
+async def all_tasks(msg: types.Message):
+    cursor.execute("SELECT name,type,hours_left FROM tasks")
+    rows = cursor.fetchall()
+
+    if not rows:
+        return await msg.answer("Нет записей")
+
+    max_hours = max([r[2] for r in rows]) if rows else 1
+
+    lines = []
+    for name, typ, hours in rows:
+        percent = int((hours / max_hours) * 100) if max_hours else 0
+        bar = progress_bar(percent)
+
+        lines.append(
+            f"👤 {name}\n📌 {typ}\n⏳ {hours//24}д {hours%24}ч\n{bar} {percent}%\n"
+        )
+
+    await msg.answer("\n".join(lines))
+
+# ================= DELETE =================
 
 async def del_all(msg: types.Message):
     cursor.execute("SELECT chat_id,message_id FROM tasks WHERE user_id=%s",
@@ -216,6 +252,20 @@ async def del_all(msg: types.Message):
                    (msg.from_user.id,))
 
     await msg.answer("Удалено ✅")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("del"))
+async def delete_one(c: CallbackQuery):
+    await c.answer()
+
+    tid = int(c.data.split(":")[1])
+
+    cursor.execute("SELECT chat_id,message_id FROM tasks WHERE id=%s", (tid,))
+    r = cursor.fetchone()
+
+    if r:
+        await delete_safe(r[0], r[1])
+
+    cursor.execute("DELETE FROM tasks WHERE id=%s", (tid,))
 
 # ================= FLOW =================
 
@@ -271,16 +321,17 @@ async def hours_cb(c: CallbackQuery, state: FSMContext):
     nick = await get_nick(c.from_user.id)
 
     cursor.execute("""
-    INSERT INTO tasks (user_id,name,type,hours_left,delete_at,chat_id,message_id)
-    VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id
+    INSERT INTO tasks (user_id,name,type,hours_left,delete_at,chat_id,message_id,thread_id)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
     """, (c.from_user.id, nick, data["type"], total,
-          delete_at, c.message.chat.id, 0))
+          delete_at, c.message.chat.id, 0, c.message.message_thread_id))
 
     tid = cursor.fetchone()[0]
 
     msg = await c.message.answer(
         f"👤 {nick}\n📌 {data['type']}\n⏳ {days}д {hours}ч",
-        reply_markup=del_kb(tid)
+        reply_markup=del_kb(tid),
+        message_thread_id=c.message.message_thread_id
     )
 
     cursor.execute("UPDATE tasks SET message_id=%s WHERE id=%s",
@@ -295,21 +346,20 @@ async def update_tasks():
     cursor.execute("SELECT * FROM tasks")
 
     for t in cursor.fetchall():
-        tid, uid, name, typ, hours, delete_at, chat_id, msg_id = t
+        tid, uid, name, typ, hours, delete_at, chat_id, msg_id, thread_id = t
 
         if now >= delete_at:
             await delete_safe(chat_id, msg_id)
             cursor.execute("DELETE FROM tasks WHERE id=%s", (tid,))
             continue
 
-        hours -= 4
-        if hours < 0:
-            hours = 0
+        hours = max(0, hours - 4)
 
         try:
             await bot.edit_message_text(
                 f"👤 {name}\n📌 {typ}\n⏳ {hours//24}д {hours%24}ч",
-                chat_id, msg_id,
+                chat_id,
+                msg_id,
                 reply_markup=del_kb(tid)
             )
         except:

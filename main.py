@@ -53,7 +53,6 @@ CREATE TABLE IF NOT EXISTS tasks (
 """)
 
 # ================= STATE =================
-
 user_states = {}
 
 # ================= HELPERS =================
@@ -64,19 +63,9 @@ async def delete_safe(chat_id, message_id):
     except:
         pass
 
-async def safe_send(chat_id, text, reply_markup=None, thread_id=None):
-    return await bot.send_message(
-        chat_id,
-        text,
-        reply_markup=reply_markup,
-        message_thread_id=thread_id
-    )
-
-async def safe_edit(chat_id, msg_id, text, reply_markup=None):
-    try:
-        await bot.edit_message_text(text, chat_id, msg_id, reply_markup=reply_markup)
-    except:
-        pass
+async def send_step(chat_id, text, kb, thread_id):
+    msg = await bot.send_message(chat_id, text, reply_markup=kb, message_thread_id=thread_id)
+    return msg
 
 async def get_nick(user_id):
     cursor.execute("SELECT nickname FROM users WHERE user_id=%s", (user_id,))
@@ -86,18 +75,10 @@ async def get_nick(user_id):
 # ================= UI =================
 
 def menu_kb():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Создать", callback_data="create"),
-        InlineKeyboardButton("📋 Мои записи", callback_data="my"),
-    )
-    kb.add(
-        InlineKeyboardButton("📊 Все записи", callback_data="all"),
-        InlineKeyboardButton("❌ Удалить мои записи", callback_data="del_all"),
-    )
-    kb.add(
-        InlineKeyboardButton("✏️ Изменить ник", callback_data="set_nick"),
-    )
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ Создать", callback_data="create"))
+    kb.add(InlineKeyboardButton("📋 Мои записи", callback_data="my"))
+    kb.add(InlineKeyboardButton("❌ Удалить мои записи", callback_data="del_all"))
     return kb
 
 def type_kb():
@@ -138,36 +119,36 @@ async def menu(msg: types.Message):
 
     nick = await get_nick(msg.from_user.id)
     if not nick:
-        user_states[msg.from_user.id] = {"step": "wait_nick"}
-        return await safe_send(msg.chat.id, "Введите свой ник в игре", thread_id=msg.message_thread_id)
+        user_states[msg.from_user.id] = {"step": "nick"}
+        return await msg.answer("Введите свой ник")
 
-    await safe_send(msg.chat.id, "📋 Меню:", menu_kb(), msg.message_thread_id)
+    await msg.answer("Меню:", reply_markup=menu_kb())
 
 # ================= CREATE =================
 
 @dp.callback_query_handler(lambda c: c.data == "create")
-async def create_handler(c: CallbackQuery):
+async def create(c: CallbackQuery):
     uid = c.from_user.id
-    thread_id = c.message.message_thread_id
+    thread = c.message.message_thread_id
 
     await c.answer()
 
     cursor.execute("SELECT id FROM tasks WHERE user_id=%s", (uid,))
     if len(cursor.fetchall()) >= 2:
-        await safe_send(c.message.chat.id, "У тебя уже есть созданные записи, удали лишнее", thread_id=thread_id)
-        return
+        return await c.message.answer("У тебя уже есть 2 записи")
 
-    msg = await safe_send(c.message.chat.id, "Что делаем?", type_kb(), thread_id)
+    msg = await send_step(c.message.chat.id, "Что делаем?", type_kb(), thread)
 
     user_states[uid] = {
-        "thread": thread_id,
-        "flow_msg_id": msg.message_id
+        "step": "type",
+        "msg_id": msg.message_id,
+        "thread": thread
     }
 
 # ================= TYPE =================
 
 @dp.callback_query_handler(lambda c: c.data.startswith("type_"))
-async def type_handler(c: CallbackQuery):
+async def choose_type(c: CallbackQuery):
     uid = c.from_user.id
     st = user_states.get(uid)
 
@@ -178,17 +159,15 @@ async def type_handler(c: CallbackQuery):
 
     st["type"] = "🏗 Строим" if "build" in c.data else "🔬 Исследуем"
 
-    await safe_edit(
-        c.message.chat.id,
-        st["flow_msg_id"],
-        "Выбери диапазон:",
-        range_kb()
-    )
+    await delete_safe(c.message.chat.id, st["msg_id"])
+
+    msg = await send_step(c.message.chat.id, "Выбери диапазон", range_kb(), st["thread"])
+    st["msg_id"] = msg.message_id
 
 # ================= RANGE =================
 
 @dp.callback_query_handler(lambda c: c.data.startswith("range_"))
-async def range_handler(c: CallbackQuery):
+async def choose_range(c: CallbackQuery):
     uid = c.from_user.id
     st = user_states.get(uid)
 
@@ -199,16 +178,15 @@ async def range_handler(c: CallbackQuery):
 
     start = int(c.data.split("_")[1])
 
-    await bot.edit_message_reply_markup(
-        c.message.chat.id,
-        st["flow_msg_id"],
-        reply_markup=days_kb(start)
-    )
+    await delete_safe(c.message.chat.id, st["msg_id"])
 
-# ================= DAY (FIX) =================
+    msg = await send_step(c.message.chat.id, "Выбери день", days_kb(start), st["thread"])
+    st["msg_id"] = msg.message_id
+
+# ================= DAY =================
 
 @dp.callback_query_handler(lambda c: c.data.startswith("day_"))
-async def day_handler(c: CallbackQuery):
+async def choose_day(c: CallbackQuery):
     uid = c.from_user.id
     st = user_states.get(uid)
 
@@ -219,26 +197,19 @@ async def day_handler(c: CallbackQuery):
 
     st["days"] = int(c.data.split("_")[1])
 
-    # 🔥 КЛЮЧЕВОЙ ФИКС — новое сообщение
-    await delete_safe(c.message.chat.id, st["flow_msg_id"])
+    await delete_safe(c.message.chat.id, st["msg_id"])
 
-    msg = await safe_send(
-        c.message.chat.id,
-        "Сколько часов?",
-        hours_kb(),
-        st["thread"]
-    )
-
-    st["flow_msg_id"] = msg.message_id
+    msg = await send_step(c.message.chat.id, "Выбери часы", hours_kb(), st["thread"])
+    st["msg_id"] = msg.message_id
 
 # ================= HOURS =================
 
 @dp.callback_query_handler(lambda c: c.data.startswith("hour_"))
-async def hour_handler(c: CallbackQuery):
+async def choose_hours(c: CallbackQuery):
     uid = c.from_user.id
     st = user_states.get(uid)
 
-    if not st or "days" not in st or "type" not in st:
+    if not st or "days" not in st:
         return await c.answer("Ошибка, начни заново", show_alert=True)
 
     await c.answer()
@@ -260,7 +231,7 @@ async def hour_handler(c: CallbackQuery):
 
     msg = await bot.send_message(
         c.message.chat.id,
-        f"👤 {nick}\n📌 {st['type']}\n⏳ {days}д {hours}ч",
+        f"{nick}\n{st['type']}\n{days}д {hours}ч",
         reply_markup=del_kb(tid),
         message_thread_id=st["thread"]
     )
@@ -268,57 +239,12 @@ async def hour_handler(c: CallbackQuery):
     cursor.execute("UPDATE tasks SET message_id=%s WHERE id=%s",
                    (msg.message_id, tid))
 
-    await delete_safe(c.message.chat.id, st["flow_msg_id"])
+    await delete_safe(c.message.chat.id, st["msg_id"])
     user_states.pop(uid, None)
-
-# ================= DELETE =================
-
-@dp.callback_query_handler(lambda c: c.data.startswith("del_"))
-async def delete_handler(c: CallbackQuery):
-    tid = int(c.data.split("_")[1])
-
-    cursor.execute("SELECT chat_id,message_id,user_id FROM tasks WHERE id=%s", (tid,))
-    r = cursor.fetchone()
-
-    if not r:
-        return
-
-    chat_id, msg_id, owner = r
-
-    if owner != c.from_user.id:
-        return
-
-    await delete_safe(chat_id, msg_id)
-    cursor.execute("DELETE FROM tasks WHERE id=%s", (tid,))
-
-# ================= UPDATE =================
-
-async def update_tasks():
-    cursor.execute("SELECT * FROM tasks")
-
-    for t in cursor.fetchall():
-        tid, uid, name, typ, hours, delete_at, chat_id, msg_id, thread_id = t
-
-        hours = max(0, hours - 4)
-
-        try:
-            await bot.edit_message_text(
-                f"👤 {name}\n📌 {typ}\n⏳ {hours//24}д {hours%24}ч",
-                chat_id,
-                msg_id,
-                reply_markup=del_kb(tid),
-                message_thread_id=thread_id
-            )
-        except:
-            pass
-
-        cursor.execute("UPDATE tasks SET hours_left=%s WHERE id=%s",
-                       (hours, tid))
 
 # ================= START =================
 
 async def on_startup(dp):
-    scheduler.add_job(update_tasks, "interval", hours=4)
     scheduler.start()
 
 if __name__ == "__main__":

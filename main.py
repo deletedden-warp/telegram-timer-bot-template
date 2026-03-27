@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 )
 """)
 
-# ================= TEMP STATE =================
+# ================= STATE =================
 user_states = {}
 
 # ================= HELPERS =================
@@ -62,12 +62,14 @@ async def delete_safe(chat_id, message_id):
     except:
         pass
 
-async def auto_delete(chat_id, message_id, delay=60):
+async def auto_delete(chat_id, message_id, delay=10):
     await asyncio.sleep(delay)
     await delete_safe(chat_id, message_id)
 
 async def safe_send(chat_id, text, reply_markup=None):
-    return await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    asyncio.create_task(auto_delete(chat_id, msg.message_id))
+    return msg
 
 async def get_nick(user_id):
     cursor.execute("SELECT nickname FROM users WHERE user_id=%s", (user_id,))
@@ -132,11 +134,7 @@ def del_kb(tid):
 async def menu(msg: types.Message):
     await delete_safe(msg.chat.id, msg.message_id)
 
-    await safe_send(
-        msg.chat.id,
-        "📋 Меню:",
-        reply_markup=menu_kb()
-    )
+    await safe_send(msg.chat.id, "📋 Меню:", menu_kb())
 
 # ================= CALLBACK =================
 
@@ -153,12 +151,11 @@ async def callbacks(c: CallbackQuery):
 
         if not nick:
             user_states[uid] = {"step": "wait_nick_create"}
-            m = await safe_send(c.message.chat.id, "Введи ник:")
-            asyncio.create_task(auto_delete(c.message.chat.id, m.message_id))
+            await safe_send(c.message.chat.id, "Введи ник:")
             return
 
         user_states[uid] = {}
-        m = await safe_send(c.message.chat.id, "Что делаем?", type_kb())
+        await safe_send(c.message.chat.id, "Что делаем?", type_kb())
         return
 
     # ===== TYPE =====
@@ -181,14 +178,13 @@ async def callbacks(c: CallbackQuery):
 
     # ===== HOURS =====
     if data.startswith("hour_"):
-        st = user_states.get(uid, {})
+        st = user_states.get(uid)
         if not st:
             return
 
         hours = int(data.split("_")[1])
         days = st["days"]
         total = days * 24 + hours
-
         nick = await get_nick(uid)
 
         cursor.execute("""
@@ -200,10 +196,10 @@ async def callbacks(c: CallbackQuery):
 
         tid = cursor.fetchone()[0]
 
-        msg = await safe_send(
+        msg = await bot.send_message(
             c.message.chat.id,
             f"👤 {nick}\n📌 {st['type']}\n⏳ {days}д {hours}ч",
-            del_kb(tid)
+            reply_markup=del_kb(tid)
         )
 
         cursor.execute("UPDATE tasks SET message_id=%s WHERE id=%s",
@@ -212,24 +208,36 @@ async def callbacks(c: CallbackQuery):
         user_states.pop(uid, None)
         return
 
-    # ===== SET NICK =====
-    if data == "set_nick":
-        user_states[uid] = {"step": "wait_nick"}
-        m = await safe_send(c.message.chat.id, "Введи ник:")
-        asyncio.create_task(auto_delete(c.message.chat.id, m.message_id))
-        return
-
-    # ===== DELETE =====
+    # ===== DELETE ONE =====
     if data.startswith("del_"):
         tid = int(data.split("_")[1])
 
-        cursor.execute("SELECT chat_id,message_id FROM tasks WHERE id=%s", (tid,))
+        cursor.execute("SELECT chat_id,message_id,user_id FROM tasks WHERE id=%s", (tid,))
         r = cursor.fetchone()
 
-        if r:
-            await delete_safe(r[0], r[1])
+        if not r:
+            return
 
+        chat_id, msg_id, owner = r
+
+        # 🔥 защита — только владелец может удалить
+        if owner != uid:
+            return await safe_send(c.message.chat.id, "Это не твоя запись ❌")
+
+        await delete_safe(chat_id, msg_id)
         cursor.execute("DELETE FROM tasks WHERE id=%s", (tid,))
+        return
+
+    # ===== DELETE ALL =====
+    if data == "del_all":
+        cursor.execute("SELECT chat_id,message_id FROM tasks WHERE user_id=%s", (uid,))
+        rows = cursor.fetchall()
+
+        for chat_id, msg_id in rows:
+            await delete_safe(chat_id, msg_id)
+
+        cursor.execute("DELETE FROM tasks WHERE user_id=%s", (uid,))
+        await safe_send(c.message.chat.id, "Все твои записи удалены ✅")
         return
 
     # ===== MY =====
@@ -252,7 +260,7 @@ async def callbacks(c: CallbackQuery):
         if not rows:
             return await safe_send(c.message.chat.id, "Нет записей")
 
-        max_hours = max([r[2] for r in rows]) if rows else 1
+        max_hours = max([r[2] for r in rows])
 
         text = ""
         for name, typ, hours in rows:
@@ -264,15 +272,10 @@ async def callbacks(c: CallbackQuery):
         await safe_send(c.message.chat.id, text)
         return
 
-    # ===== DELETE ALL =====
-    if data == "del_all":
-        cursor.execute("SELECT chat_id,message_id FROM tasks WHERE user_id=%s", (uid,))
-        for chat_id, msg_id in cursor.fetchall():
-            await delete_safe(chat_id, msg_id)
-
-        cursor.execute("DELETE FROM tasks WHERE user_id=%s", (uid,))
-        m = await safe_send(c.message.chat.id, "Удалено ✅")
-        asyncio.create_task(auto_delete(c.message.chat.id, m.message_id))
+    # ===== SET NICK =====
+    if data == "set_nick":
+        user_states[uid] = {"step": "wait_nick"}
+        await safe_send(c.message.chat.id, "Введи ник:")
         return
 
 # ================= TEXT =================
@@ -285,7 +288,6 @@ async def text(msg: types.Message):
     if not st:
         return
 
-    # ===== SAVE NICK =====
     if st.get("step") in ["wait_nick", "wait_nick_create"]:
         cursor.execute("""
         INSERT INTO users (user_id, nickname)
@@ -293,8 +295,7 @@ async def text(msg: types.Message):
         ON CONFLICT (user_id) DO UPDATE SET nickname = EXCLUDED.nickname
         """, (uid, msg.text.strip()))
 
-        m = await msg.answer("Ник сохранён ✅")
-        asyncio.create_task(auto_delete(msg.chat.id, m.message_id))
+        await safe_send(msg.chat.id, "Ник сохранён ✅")
 
         if st["step"] == "wait_nick_create":
             user_states[uid] = {}

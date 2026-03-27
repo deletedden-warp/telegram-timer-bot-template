@@ -147,7 +147,7 @@ async def save_nick(msg: types.Message, state: FSMContext):
 
 # ================= CALLBACKS =================
 
-@dp.callback_query_handler(lambda c: c.data in ["build", "research"], state=CreateTask.type)
+@dp.callback_query_handler(lambda c: c.data in ["build", "research"])
 async def type_cb(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
@@ -173,6 +173,9 @@ async def hours_cb(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
     data = await state.get_data()
+
+    if "days" not in data or "type" not in data:
+        return await c.message.answer("Ошибка, начни заново /create")
 
     hours = int(c.data.split(":")[1])
     days = data["days"]
@@ -200,12 +203,6 @@ async def hours_cb(c: CallbackQuery, state: FSMContext):
 
     await c.message.delete()
     await state.finish()
-
-# ================= START =================
-
-async def on_startup(dp):
-    scheduler.add_job(update_tasks, "interval", hours=4)
-    scheduler.start()
 
 # ================= UPDATE =================
 
@@ -239,6 +236,12 @@ async def update_tasks():
 
         cursor.execute("UPDATE tasks SET hours_left=%s WHERE id=%s",
                        (hours, tid))
+
+# ================= START =================
+
+async def on_startup(dp):
+    scheduler.add_job(update_tasks, "interval", hours=4)
+    scheduler.start()
 
 if __name__ == "__main__":
     executor.start_polling(dp, on_startup=on_startup)

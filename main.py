@@ -67,21 +67,17 @@ class SetNick(StatesGroup):
 # ================= UI =================
 
 def type_kb():
-    kb = InlineKeyboardMarkup()
-    kb.add(
+    return InlineKeyboardMarkup().add(
         InlineKeyboardButton("🏗 Строим", callback_data="build"),
         InlineKeyboardButton("🔬 Исследуем", callback_data="research")
     )
-    return kb
 
 def range_kb():
-    kb = InlineKeyboardMarkup()
-    kb.add(
+    return InlineKeyboardMarkup().add(
         InlineKeyboardButton("1-30", callback_data="r:1"),
         InlineKeyboardButton("31-60", callback_data="r:31"),
         InlineKeyboardButton("61-90", callback_data="r:61")
     )
-    return kb
 
 def days_kb(start):
     kb = InlineKeyboardMarkup(row_width=5)
@@ -112,7 +108,7 @@ async def get_nick(user_id):
 @dp.message_handler(commands=["create"])
 async def create_cmd(msg: types.Message):
     if msg.chat.type == "private":
-        return await msg.answer("Используй бота в группе")
+        return await msg.answer("Используй в группе")
 
     cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=%s",
                    (msg.from_user.id,))
@@ -121,7 +117,7 @@ async def create_cmd(msg: types.Message):
 
     nick = await get_nick(msg.from_user.id)
     if not nick:
-        await msg.answer("Введи свой ник:")
+        await msg.answer("Введи ник:")
         await SetNick.nick.set()
         return
 
@@ -145,37 +141,42 @@ async def save_nick(msg: types.Message, state: FSMContext):
     await msg.answer("Что делаем?", reply_markup=type_kb())
     await CreateTask.type.set()
 
-# ================= CALLBACKS =================
+# ================= TYPE =================
 
-@dp.callback_query_handler(lambda c: c.data in ["build", "research"])
+@dp.callback_query_handler(lambda c: c.data in ["build", "research"], state=CreateTask.type)
 async def type_cb(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
     t = "🏗 Строим" if c.data == "build" else "🔬 Исследуем"
     await state.update_data(type=t)
 
-    await c.message.edit_text("Выбери диапазон дней:", reply_markup=range_kb())
+    await c.message.edit_text("Выбери диапазон:", reply_markup=range_kb())
+    await CreateTask.days.set()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("r"))
+# ================= DAYS =================
+
+@dp.callback_query_handler(lambda c: c.data.startswith("r"), state=CreateTask.days)
 async def range_cb(c: CallbackQuery):
     await c.answer()
     start = int(c.data.split(":")[1])
     await c.message.edit_text("Сколько дней?", reply_markup=days_kb(start))
 
-@dp.callback_query_handler(lambda c: c.data.startswith("d"))
+@dp.callback_query_handler(lambda c: c.data.startswith("d"), state=CreateTask.days)
 async def days_cb(c: CallbackQuery, state: FSMContext):
     await c.answer()
-    await state.update_data(days=int(c.data.split(":")[1]))
-    await c.message.edit_text("Сколько часов?", reply_markup=hours_kb())
 
-@dp.callback_query_handler(lambda c: c.data.startswith("h"))
+    await state.update_data(days=int(c.data.split(":")[1]))
+
+    await c.message.edit_text("Сколько часов?", reply_markup=hours_kb())
+    await CreateTask.hours.set()
+
+# ================= HOURS =================
+
+@dp.callback_query_handler(lambda c: c.data.startswith("h"), state=CreateTask.hours)
 async def hours_cb(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
     data = await state.get_data()
-
-    if "days" not in data or "type" not in data:
-        return await c.message.answer("Ошибка, начни заново /create")
 
     hours = int(c.data.split(":")[1])
     days = data["days"]

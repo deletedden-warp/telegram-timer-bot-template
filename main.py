@@ -81,10 +81,7 @@ async def timeout_clear(uid):
     await clear_all(uid)
 
     try:
-        await bot.send_message(
-            st["chat"],
-            "⏱ Время вышло. Начни заново через /menu"
-        )
+        await bot.send_message(st["chat"], "⏱ Время вышло. Начни заново через /menu")
     except:
         pass
 
@@ -126,10 +123,19 @@ def days_kb(start):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"d_{i}"))
     return kb
 
-def hours_kb():
-    kb = InlineKeyboardMarkup(row_width=6)
-    for i in range(1, 24):
-        kb.insert(InlineKeyboardButton(str(i), callback_data=f"h_{i}"))
+# 🔥 ПАГИНАЦИЯ ЧАСОВ
+def hours_kb(page=1):
+    kb = InlineKeyboardMarkup(row_width=4)
+
+    if page == 1:
+        for i in range(1, 13):
+            kb.insert(InlineKeyboardButton(str(i), callback_data=f"h_{i}"))
+        kb.add(InlineKeyboardButton("➡️ Далее", callback_data="h_page_2"))
+    else:
+        for i in range(13, 24):
+            kb.insert(InlineKeyboardButton(str(i), callback_data=f"h_{i}"))
+        kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="h_page_1"))
+
     return kb
 
 # ================= MENU =================
@@ -225,10 +231,18 @@ async def day_handler(c: CallbackQuery):
     user_states[uid]["days"] = int(c.data.split("_")[1])
     reset_timer(uid)
 
-    m = await c.message.answer("⏳ Выбери часы:", reply_markup=hours_kb())
+    m = await c.message.answer("⏳ Выбери часы:", reply_markup=hours_kb(1))
     track_msg(uid, m)
 
-# HOURS
+# 🔥 ПЕРЕКЛЮЧЕНИЕ СТРАНИЦ ЧАСОВ
+@dp.callback_query_handler(Text(startswith="h_page_"))
+async def hours_page(c: CallbackQuery):
+    await c.answer()
+
+    page = int(c.data.split("_")[-1])
+    await c.message.edit_reply_markup(reply_markup=hours_kb(page))
+
+# HOURS (ФИНАЛ)
 @dp.callback_query_handler(Text(startswith="h_"))
 async def hours_handler(c: CallbackQuery):
     await c.answer()

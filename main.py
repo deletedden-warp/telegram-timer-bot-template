@@ -178,7 +178,7 @@ async def create_cmd(msg: types.Message, state: FSMContext):
 
     if not nick:
         m = await msg.answer("Введи ник:")
-        await state.update_data(msgs=[m.message_id])
+        await state.update_data(msgs=[m.message_id], creating=True)
         await SetNick.nick.set()
         return
 
@@ -196,6 +196,8 @@ async def edit_nick(msg: types.Message):
 async def save_nick(msg: types.Message, state: FSMContext):
     await delete_safe(msg.chat.id, msg.message_id)
 
+    data = await state.get_data()
+
     cursor.execute("""
     INSERT INTO users (user_id, nickname)
     VALUES (%s, %s)
@@ -203,7 +205,14 @@ async def save_nick(msg: types.Message, state: FSMContext):
     """, (msg.from_user.id, msg.text.strip()))
 
     await msg.answer("Ник сохранён ✅")
-    await state.finish()
+
+    # 🔥 ВОЗВРАТ В СОЗДАНИЕ
+    if data.get("creating"):
+        m = await msg.answer("Что делаем?", reply_markup=type_kb())
+        await state.update_data(msgs=[m.message_id])
+        await CreateTask.type.set()
+    else:
+        await state.finish()
 
 # ================= MY =================
 

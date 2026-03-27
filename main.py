@@ -7,7 +7,6 @@ import psycopg2
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import *
 from aiogram.utils import executor
-from aiogram.dispatcher.filters import Text
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -42,7 +41,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     user_id BIGINT,
     name TEXT,
     type TEXT,
-    hours INTEGER
+    days INTEGER
 )
 """)
 
@@ -50,13 +49,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 user_states = {}
 
-# ================= HELPERS =================
-
-def init(uid, chat_id):
+def new_state(uid, chat_id):
     user_states[uid] = {
         "step": None,
-        "msgs": [],
         "chat": chat_id,
+        "msgs": [],
         "time": datetime.utcnow()
     }
 
@@ -64,9 +61,9 @@ def track(uid, msg):
     user_states[uid]["msgs"].append((msg.chat.id, msg.message_id))
 
 async def clear(uid):
-    for chat, mid in user_states.get(uid, {}).get("msgs", []):
+    for chat_id, msg_id in user_states.get(uid, {}).get("msgs", []):
         try:
-            await bot.delete_message(chat, mid)
+            await bot.delete_message(chat_id, msg_id)
         except:
             pass
 
@@ -81,21 +78,14 @@ async def get_nick(uid):
     r = cursor.fetchone()
     return r[0] if r else None
 
-async def delete_after(msg, sec=60):
-    await asyncio.sleep(sec)
-    try:
-        await msg.delete()
-    except:
-        pass
-
 # ================= UI =================
 
 def menu_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("➕ Создать запись", callback_data="create"))
     kb.add(InlineKeyboardButton("❌ Удалить мои записи", callback_data="del_all"))
-    kb.add(InlineKeyboardButton("📊 Посмотреть все записи", callback_data="all"))
-    kb.add(InlineKeyboardButton("✏️ Изменить мой никнейм", callback_data="edit"))
+    kb.add(InlineKeyboardButton("📋 Посмотреть все записи", callback_data="all"))
+    kb.add(InlineKeyboardButton("✏️ Изменить ник", callback_data="edit"))
     kb.add(InlineKeyboardButton("💀 Удалиться из базы", callback_data="delete_me"))
     return kb
 
@@ -128,20 +118,13 @@ def days_kb(start):
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_range"))
     return kb
 
-def hours_kb():
-    kb = InlineKeyboardMarkup(row_width=6)
-    for i in range(1, 24):
-        kb.insert(InlineKeyboardButton(str(i), callback_data=f"h_{i}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_day"))
-    return kb
-
 # ================= MENU =================
 
 @dp.message_handler(commands=["menu"])
 async def menu(msg: types.Message):
     uid = msg.from_user.id
 
-    init(uid, msg.chat.id)
+    new_state(uid, msg.chat.id)
 
     nick = await get_nick(uid)
 
@@ -170,6 +153,8 @@ async def text(msg: types.Message):
         user_states.pop(uid, None)
         return await msg.answer("⏱ Время вышло. Введи /menu")
 
+    st["time"] = datetime.utcnow()
+
     if st["step"] == "nick":
         cursor.execute("""
         INSERT INTO users (user_id, nickname)
@@ -178,10 +163,11 @@ async def text(msg: types.Message):
         """, (uid, msg.text.strip()))
 
         await clear(uid)
-        init(uid, msg.chat.id)
 
+        new_state(uid, msg.chat.id)
         user_states[uid]["step"] = "menu"
-        m = await msg.answer("📋 Меню:", reply_markup=menu_kb())
+
+        m = await msg.answer("✅ Готово! Вот меню:", reply_markup=menu_kb())
         track(uid, m)
 
     elif st["step"] == "edit":
@@ -189,99 +175,125 @@ async def text(msg: types.Message):
                        (msg.text.strip(), uid))
 
         await clear(uid)
-        m = await msg.answer(f"✅ Отлично! Теперь ты: {msg.text}")
-        asyncio.create_task(delete_after(m))
+
+        m = await msg.answer(f"✅ Теперь ты: {msg.text}")
+        asyncio.create_task(delete_after(m, 60))
+
         user_states.pop(uid, None)
 
-# ================= CREATE FLOW =================
+# ================= CALLBACK =================
 
-@dp.callback_query_handler(Text(equals="create"))
-async def create(c: CallbackQuery):
+@dp.callback_query_handler()
+async def cb(c: CallbackQuery):
+    await c.answer()
     uid = c.from_user.id
     st = user_states.get(uid)
 
-    if not st or st["step"] != "menu":
+    if not st:
         return
 
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=%s", (uid,))
-    if cursor.fetchone()[0] >= 2:
-        return await c.message.answer("⚠️ У тебя уже есть созданные записи, удали лишнее")
+    if timeout(uid):
+        await clear(uid)
+        user_states.pop(uid, None)
+        return await c.message.answer("⏱ Время вышло. /menu")
 
-    st["step"] = "type"
+    st["time"] = datetime.utcnow()
 
-    m = await c.message.answer("❓ Что делаем?", reply_markup=type_kb())
-    track(uid, m)
+    # ===== СОЗДАНИЕ =====
+    if c.data == "create" and st["step"] == "menu":
 
-# TYPE
-@dp.callback_query_handler(Text(startswith="type_"))
-async def choose_type(c: CallbackQuery):
-    uid = c.from_user.id
-    st = user_states.get(uid)
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=%s", (uid,))
+        if cursor.fetchone()[0] >= 2:
+            return await c.message.answer("⚠️ У тебя уже есть 2 записи")
 
-    if not st or st["step"] != "type":
-        return
+        st["step"] = "type"
+        m = await c.message.answer("❓ Что делаем?", reply_markup=type_kb())
+        track(uid, m)
 
-    st["type"] = "Строим" if "build" in c.data else "Исследуем"
-    st["step"] = "range"
+    elif c.data.startswith("type_") and st["step"] == "type":
+        st["type"] = "Стройка" if "build" in c.data else "Исследование"
+        st["step"] = "range"
 
-    m = await c.message.answer("📅 Сколько осталось дней до завершения?", reply_markup=range_kb())
-    track(uid, m)
+        m = await c.message.answer("📅 Сколько осталось дней до завершения?", reply_markup=range_kb())
+        track(uid, m)
 
-# RANGE
-@dp.callback_query_handler(Text(startswith="r_"))
-async def choose_range(c: CallbackQuery):
-    uid = c.from_user.id
-    st = user_states.get(uid)
+    elif c.data.startswith("r_") and st["step"] == "range":
+        st["range"] = int(c.data.split("_")[1])
+        st["step"] = "day"
 
-    if not st or st["step"] != "range":
-        return
+        m = await c.message.answer("📆 Выбери день:", reply_markup=days_kb(st["range"]))
+        track(uid, m)
 
-    start = int(c.data.split("_")[1])
-    st["step"] = "day"
+    elif c.data.startswith("d_") and st["step"] == "day":
 
-    m = await c.message.answer("📆 Выбери день:", reply_markup=days_kb(start))
-    track(uid, m)
+        days = int(c.data.split("_")[1])
+        nick = await get_nick(uid)
 
-# DAY
-@dp.callback_query_handler(Text(startswith="d_"))
-async def choose_day(c: CallbackQuery):
-    uid = c.from_user.id
-    st = user_states.get(uid)
+        cursor.execute("""
+        INSERT INTO tasks (user_id,name,type,days)
+        VALUES (%s,%s,%s,%s)
+        """, (uid, nick, st["type"], days))
 
-    if not st or st["step"] != "day":
-        return
+        await clear(uid)
 
-    st["days"] = int(c.data.split("_")[1])
-    st["step"] = "hours"
+        m = await c.message.answer("🎉 Запись создана. Ты молодец!")
+        asyncio.create_task(delete_after(m, 60))
 
-    m = await c.message.answer("⏳ Сколько осталось часов до завершения?", reply_markup=hours_kb())
-    track(uid, m)
+        user_states.pop(uid, None)
 
-# HOURS (ФИНАЛ)
-@dp.callback_query_handler(Text(startswith="h_"))
-async def choose_hours(c: CallbackQuery):
-    uid = c.from_user.id
-    st = user_states.get(uid)
+    # ===== ВСЕ ЗАПИСИ =====
+    elif c.data == "all":
+        cursor.execute("SELECT name,type,days FROM tasks")
+        rows = cursor.fetchall()
 
-    if not st or st["step"] != "hours":
-        return
+        if not rows:
+            return await c.message.answer("📭 Созданных записей нет")
 
-    hours = int(c.data.split("_")[1])
-    total = st["days"] * 24 + hours
+        text = "📊 Все записи:\n\n"
+        for i, r in enumerate(rows, 1):
+            text += f"{i}) {r[0]} \\ {r[1]} \\ Осталось {r[2]} дней\n"
 
-    nick = await get_nick(uid)
+        await clear(uid)
+        await c.message.answer(text)
 
-    cursor.execute("""
-    INSERT INTO tasks (user_id,name,type,hours)
-    VALUES (%s,%s,%s,%s)
-    """, (uid, nick, st["type"], total))
+    # ===== УДАЛЕНИЕ =====
+    elif c.data == "del_all":
+        cursor.execute("DELETE FROM tasks WHERE user_id=%s", (uid,))
+        await clear(uid)
 
-    await clear(uid)
+        m = await c.message.answer("🗑 Удалено, можешь создавать заново")
+        asyncio.create_task(delete_after(m, 60))
 
-    m = await c.message.answer("🎉 Запись создана. Ты молодец!")
-    asyncio.create_task(delete_after(m))
+        user_states.pop(uid, None)
 
-    user_states.pop(uid, None)
+    # ===== СМЕНА НИКА =====
+    elif c.data == "edit":
+        nick = await get_nick(uid)
+
+        st["step"] = "edit"
+        m = await c.message.answer(f"✏️ Сейчас твой ник: {nick}\nВведи новый:")
+        track(uid, m)
+
+    # ===== УДАЛИТЬ СЕБЯ =====
+    elif c.data == "delete_me":
+        cursor.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+        cursor.execute("DELETE FROM tasks WHERE user_id=%s", (uid,))
+
+        await clear(uid)
+
+        m = await c.message.answer("💀 Я тебя забыл...")
+        asyncio.create_task(delete_after(m, 60))
+
+        user_states.pop(uid, None)
+
+# ================= DELETE =================
+
+async def delete_after(msg, sec):
+    await asyncio.sleep(sec)
+    try:
+        await msg.delete()
+    except:
+        pass
 
 # ================= START =================
 

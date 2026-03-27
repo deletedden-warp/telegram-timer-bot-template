@@ -83,7 +83,7 @@ def range_kb():
 
 def days_kb(start):
     kb = InlineKeyboardMarkup(row_width=5)
-    for i in range(start, start+30):
+    for i in range(start, start + 30):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"d:{i}"))
     return kb
 
@@ -98,24 +98,26 @@ def del_kb(tid):
         InlineKeyboardButton("❌ Удалить", callback_data=f"del:{tid}")
     )
 
-# ================= СТАРТ =================
-
-@dp.message_handler(commands=["start"])
-async def start(msg: types.Message):
-    if msg.chat.type == "private":
-        return await msg.answer("Используй бота в группе")
-    await msg.answer("Выбери:", reply_markup=main_kb())
-
-# ================= НИК =================
+# ================= HELPERS =================
 
 async def get_nick(user_id):
     cursor.execute("SELECT nickname FROM users WHERE user_id=?", (user_id,))
     r = cursor.fetchone()
     return r[0] if r else None
 
+# ================= START =================
+
+@dp.message_handler(commands=["start"])
+async def start(msg: types.Message):
+    if msg.chat.type == "private":
+        return await msg.answer("Используй бота в группе")
+    await msg.answer("Выбери действие:", reply_markup=main_kb())
+
+# ================= НИК =================
+
 @dp.message_handler(lambda m: m.text == "✏️ Изменить ник")
 async def change_nick(msg: types.Message):
-    await msg.answer("Введи ник:")
+    await msg.answer("Введи новый ник:")
     await SetNick.nick.set()
 
 @dp.message_handler(state=SetNick.nick)
@@ -123,7 +125,7 @@ async def save_nick(msg: types.Message, state: FSMContext):
     cursor.execute("REPLACE INTO users VALUES (?,?)",
                    (msg.from_user.id, msg.text))
     conn.commit()
-    await msg.answer("Сохранено ✅")
+    await msg.answer("Ник сохранён ✅")
     await state.finish()
 
 # ================= СОЗДАНИЕ =================
@@ -131,19 +133,19 @@ async def save_nick(msg: types.Message, state: FSMContext):
 @dp.message_handler(lambda m: m.text == "➕ Создать запись")
 async def create(msg: types.Message):
     if msg.chat.type == "private":
-        return await msg.answer("Только в группе")
+        return await msg.answer("Используй в группе")
 
     cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=?",
                    (msg.from_user.id,))
     if cursor.fetchone()[0] >= 2:
-        return await msg.answer("Максимум 2 записи")
+        return await msg.answer("У тебя уже 2 записи")
 
     nick = await get_nick(msg.from_user.id)
     if not nick:
-        await msg.answer("Сначала введи ник")
+        await msg.answer("Сначала задай ник")
         return
 
-    await msg.answer("Тип:", reply_markup=type_kb())
+    await msg.answer("Что делаем?", reply_markup=type_kb())
     await CreateTask.type.set()
 
 # ================= CALLBACKS =================
@@ -152,17 +154,17 @@ async def create(msg: types.Message):
 async def type_cb(c: CallbackQuery, state: FSMContext):
     t = "🏗 Строим" if c.data == "build" else "🔬 Исследуем"
     await state.update_data(type=t)
-    await c.message.edit_text("Диапазон:", reply_markup=range_kb())
+    await c.message.edit_text("Выбери диапазон дней:", reply_markup=range_kb())
 
 @dp.callback_query_handler(lambda c: c.data.startswith("r"))
 async def range_cb(c: CallbackQuery):
     start = int(c.data.split(":")[1])
-    await c.message.edit_text("Дни:", reply_markup=days_kb(start))
+    await c.message.edit_text("Сколько дней?", reply_markup=days_kb(start))
 
 @dp.callback_query_handler(lambda c: c.data.startswith("d"))
 async def days_cb(c: CallbackQuery, state: FSMContext):
     await state.update_data(days=int(c.data.split(":")[1]))
-    await c.message.edit_text("Часы:", reply_markup=hours_kb())
+    await c.message.edit_text("Сколько часов?", reply_markup=hours_kb())
 
 @dp.callback_query_handler(lambda c: c.data.startswith("h"))
 async def hours_cb(c: CallbackQuery, state: FSMContext):
@@ -171,7 +173,7 @@ async def hours_cb(c: CallbackQuery, state: FSMContext):
     hours = int(c.data.split(":")[1])
     days = data["days"]
 
-    total = days*24 + hours
+    total = days * 24 + hours
     delete_at = datetime.utcnow() + timedelta(hours=48)
 
     nick = await get_nick(c.from_user.id)
@@ -186,7 +188,7 @@ async def hours_cb(c: CallbackQuery, state: FSMContext):
     conn.commit()
 
     msg = await c.message.answer(
-        f"{nick} | {data['type']} | {days}д {hours}ч",
+        f"👤 {nick}\n📌 {data['type']}\n⏳ {days}д {hours}ч",
         reply_markup=del_kb(tid)
     )
 
@@ -207,10 +209,9 @@ async def del_task(c: CallbackQuery):
     t = cursor.fetchone()
 
     if not t or t[2] != c.from_user.id:
-        return await c.answer("Не твоя", show_alert=True)
+        return await c.answer("Не твоя запись", show_alert=True)
 
     await bot.delete_message(t[0], t[1])
-
     cursor.execute("DELETE FROM tasks WHERE id=?", (tid,))
     conn.commit()
 
@@ -223,7 +224,7 @@ async def my(msg: types.Message):
     rows = cursor.fetchall()
 
     if not rows:
-        return await msg.answer("Нет записей")
+        return await msg.answer("У тебя нет записей")
 
     text = "\n".join([f"{n} | {t} | {h//24}д {h%24}ч" for n,t,h in rows])
     await msg.answer(text)
@@ -233,7 +234,7 @@ async def all_tasks(msg: types.Message):
     cursor.execute("SELECT name,type,hours_left FROM tasks")
     rows = cursor.fetchall()
 
-    text = "\n".join([f"{n} | {t} | {h//24}д {h%24}ч" for n,t,h in rows]) or "Пусто"
+    text = "\n".join([f"{n} | {t} | {h//24}д {h%24}ч" for n,t,h in rows]) or "Нет записей"
     await msg.answer(text)
 
 # ================= УДАЛИТЬ ВСЁ =================
@@ -252,7 +253,7 @@ async def del_all(msg: types.Message):
                    (msg.from_user.id,))
     conn.commit()
 
-    await msg.answer("Удалено ✅")
+    await msg.answer("Все записи удалены ✅")
 
 # ================= ОБНОВЛЕНИЕ =================
 
@@ -278,7 +279,7 @@ async def update_tasks():
 
         try:
             await bot.edit_message_text(
-                f"{name} | {typ} | {hours//24}д {hours%24}ч",
+                f"👤 {name}\n📌 {typ}\n⏳ {hours//24}д {hours%24}ч",
                 chat_id, msg_id,
                 reply_markup=del_kb(tid)
             )

@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 """)
 
 # ================= STATE =================
+
 user_states = {}
 
 # ================= HELPERS =================
@@ -142,7 +143,7 @@ async def menu(msg: types.Message):
 
     await safe_send(msg.chat.id, "📋 Меню:", menu_kb(), msg.message_thread_id)
 
-# ================= CREATE FLOW =================
+# ================= CREATE =================
 
 @dp.callback_query_handler(lambda c: c.data == "create")
 async def create_handler(c: CallbackQuery):
@@ -153,7 +154,8 @@ async def create_handler(c: CallbackQuery):
 
     cursor.execute("SELECT id FROM tasks WHERE user_id=%s", (uid,))
     if len(cursor.fetchall()) >= 2:
-        return await safe_send(c.message.chat.id, "У тебя уже есть созданные записи, удали лишнее", thread_id=thread_id)
+        await safe_send(c.message.chat.id, "У тебя уже есть созданные записи, удали лишнее", thread_id=thread_id)
+        return
 
     msg = await safe_send(c.message.chat.id, "Что делаем?", type_kb(), thread_id)
 
@@ -162,7 +164,8 @@ async def create_handler(c: CallbackQuery):
         "flow_msg_id": msg.message_id
     }
 
-# ===== TYPE =====
+# ================= TYPE =================
+
 @dp.callback_query_handler(lambda c: c.data.startswith("type_"))
 async def type_handler(c: CallbackQuery):
     uid = c.from_user.id
@@ -182,7 +185,8 @@ async def type_handler(c: CallbackQuery):
         range_kb()
     )
 
-# ===== RANGE =====
+# ================= RANGE =================
+
 @dp.callback_query_handler(lambda c: c.data.startswith("range_"))
 async def range_handler(c: CallbackQuery):
     uid = c.from_user.id
@@ -201,7 +205,8 @@ async def range_handler(c: CallbackQuery):
         reply_markup=days_kb(start)
     )
 
-# ===== DAY =====
+# ================= DAY (FIX) =================
+
 @dp.callback_query_handler(lambda c: c.data.startswith("day_"))
 async def day_handler(c: CallbackQuery):
     uid = c.from_user.id
@@ -214,14 +219,20 @@ async def day_handler(c: CallbackQuery):
 
     st["days"] = int(c.data.split("_")[1])
 
-    await safe_edit(
+    # 🔥 КЛЮЧЕВОЙ ФИКС — новое сообщение
+    await delete_safe(c.message.chat.id, st["flow_msg_id"])
+
+    msg = await safe_send(
         c.message.chat.id,
-        st["flow_msg_id"],
         "Сколько часов?",
-        hours_kb()
+        hours_kb(),
+        st["thread"]
     )
 
-# ===== HOURS (🔥 РАБОТАЕТ СТАБИЛЬНО) =====
+    st["flow_msg_id"] = msg.message_id
+
+# ================= HOURS =================
+
 @dp.callback_query_handler(lambda c: c.data.startswith("hour_"))
 async def hour_handler(c: CallbackQuery):
     uid = c.from_user.id

@@ -1,17 +1,18 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.utils import executor
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
 
-import psycopg2
-import psycopg2.extras
+import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 
@@ -19,50 +20,42 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot, storage=MemoryStorage())
+dp = Dispatcher(storage=MemoryStorage())
+
+pool: asyncpg.Pool = None
 
 
 # ================= DB =================
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+async def init_db():
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL)
 
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id BIGINT PRIMARY KEY,
+            nickname TEXT
+        );
+        """)
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        tg_id BIGINT UNIQUE,
-        nickname TEXT
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tasks (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        action_type TEXT,
-        days INTEGER
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-init_db()
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            action_type TEXT,
+            days INTEGER
+        );
+        """)
 
 
 # ================= FSM =================
 
 class Form(StatesGroup):
-    waiting_nickname = State()
-    choosing_action = State()
-    waiting_days = State()
-    editing_nick = State()
+    nickname = State()
+    action = State()
+    days = State()
+    edit_nick = State()
 
 
 # ================= UTILS =================
@@ -76,202 +69,167 @@ async def delete_messages(messages):
             pass
 
 
-async def timeout_check(state: FSMContext, chat_id, messages):
+async def timeout(state: FSMContext, messages):
     await asyncio.sleep(180)
     data = await state.get_data()
     if data.get("active"):
-        await state.finish()
+        await state.clear()
         await delete_messages(messages)
 
 
-def get_user(tg_id):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+# ================= DB FUNCS =================
 
-    cur.execute("SELECT * FROM users WHERE tg_id=%s", (tg_id,))
-    user = cur.fetchone()
-
-    conn.close()
-    return user
+async def get_user(tg_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT * FROM users WHERE tg_id=$1", tg_id
+        )
 
 
-def create_user(tg_id, nickname):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        "INSERT INTO users (tg_id, nickname) VALUES (%s, %s)",
-        (tg_id, nickname)
-    )
-
-    conn.commit()
-    conn.close()
+async def create_user(tg_id, nickname):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (tg_id, nickname) VALUES ($1, $2)",
+            tg_id, nickname
+        )
 
 
-def update_nickname(tg_id, nickname):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        "UPDATE users SET nickname=%s WHERE tg_id=%s",
-        (nickname, tg_id)
-    )
-
-    conn.commit()
-    conn.close()
+async def update_nick(tg_id, nickname):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET nickname=$1 WHERE tg_id=$2",
+            nickname, tg_id
+        )
 
 
-def delete_user(tg_id):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("DELETE FROM users WHERE tg_id=%s", (tg_id,))
-    cur.execute("DELETE FROM tasks WHERE user_id=%s", (tg_id,))
-
-    conn.commit()
-    conn.close()
+async def delete_user(tg_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
 
 
-def get_tasks_count(tg_id):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) FROM tasks WHERE user_id=%s", (tg_id,))
-    count = cur.fetchone()[0]
-
-    conn.close()
-    return count
+async def count_tasks(tg_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE user_id=$1", tg_id
+        )
 
 
-def add_task(tg_id, action_type, days):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        "INSERT INTO tasks (user_id, action_type, days) VALUES (%s, %s, %s)",
-        (tg_id, action_type, days)
-    )
-
-    conn.commit()
-    conn.close()
+async def add_task(tg_id, action, days):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO tasks (user_id, action_type, days) VALUES ($1,$2,$3)",
+            tg_id, action, days
+        )
 
 
-def delete_tasks(tg_id):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("DELETE FROM tasks WHERE user_id=%s", (tg_id,))
-
-    conn.commit()
-    conn.close()
+async def delete_tasks(tg_id):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM tasks WHERE user_id=$1", tg_id
+        )
 
 
-def get_all_tasks():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-    cur.execute("""
-    SELECT u.nickname, t.action_type, t.days
-    FROM tasks t
-    JOIN users u ON u.tg_id = t.user_id
-    """)
-
-    tasks = cur.fetchall()
-    conn.close()
-    return tasks
+async def get_all_tasks():
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+        SELECT u.nickname, t.action_type, t.days
+        FROM tasks t
+        JOIN users u ON u.tg_id = t.user_id
+        """)
 
 
 # ================= KEYBOARDS =================
 
 def main_menu():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🛠 Создать запись")
-    kb.add("🗑 Удалить мои записи")
-    kb.add("📜 Посмотреть все записи")
-    kb.add("✏️ Изменить никнейм")
-    kb.add("💀 Удалиться из базы")
-    return kb
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛠 Создать запись", callback_data="create")],
+        [InlineKeyboardButton(text="🗑 Удалить мои записи", callback_data="delete_tasks")],
+        [InlineKeyboardButton(text="📜 Посмотреть все записи", callback_data="all_tasks")],
+        [InlineKeyboardButton(text="✏️ Изменить никнейм", callback_data="edit_nick")],
+        [InlineKeyboardButton(text="💀 Удалиться из базы", callback_data="delete_user")]
+    ])
 
 
-# ================= HANDLERS =================
+# ================= START =================
 
-@dp.message_handler(commands=["menu"])
-async def menu(message: types.Message, state: FSMContext):
-    user = get_user(message.from_user.id)
+@dp.message(F.text == "/menu")
+async def menu(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
 
     if not user:
-        msg = await message.answer("⚔️ Кто ты воин? Представься")
-        await Form.waiting_nickname.set()
+        await message.answer("⚔️ Кто ты воин? Представься")
+        await state.set_state(Form.nickname)
         return
 
     await message.answer("🧠 Что будем делать?", reply_markup=main_menu())
 
 
-@dp.message_handler(state=Form.waiting_nickname)
-async def save_nick(message: types.Message, state: FSMContext):
-    create_user(message.from_user.id, message.text)
+# ================= REG =================
+
+@dp.message(Form.nickname)
+async def reg(message: Message, state: FSMContext):
+    await create_user(message.from_user.id, message.text)
 
     await message.answer(f"👋 Приветствую тебя \"{message.text}\"!")
     await message.answer("🧠 Что будем делать?", reply_markup=main_menu())
 
-    await state.finish()
+    await state.clear()
 
 
-# ================= CREATE TASK =================
+# ================= CREATE =================
 
-@dp.message_handler(lambda m: m.text == "🛠 Создать запись")
-async def create_task(message: types.Message, state: FSMContext):
-    if get_tasks_count(message.from_user.id) >= 2:
-        await message.answer("🚫 У тебя уже максимум записей (2)")
+@dp.callback_query(F.data == "create")
+async def create(call: CallbackQuery, state: FSMContext):
+    if await count_tasks(call.from_user.id) >= 2:
+        await call.message.answer("🚫 У тебя максимум записей (2)")
         return
 
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🏗 Строим", "🔬 Исследуем")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🏗 Строим", callback_data="build"),
+            InlineKeyboardButton(text="🔬 Исследуем", callback_data="research")
+        ]
+    ])
 
-    msg = await message.answer("⚙️ Что делаем?", reply_markup=kb)
+    msg = await call.message.answer("⚙️ Что делаем?", reply_markup=kb)
 
-    await state.update_data(
-        messages=[msg],
-        active=True,
-        start_time=datetime.now()
-    )
+    await state.update_data(messages=[msg], active=True)
 
-    asyncio.create_task(timeout_check(state, message.chat.id, [msg]))
+    asyncio.create_task(timeout(state, [msg]))
 
-    await Form.choosing_action.set()
+    await state.set_state(Form.action)
 
 
-@dp.message_handler(state=Form.choosing_action)
-async def choose_action(message: types.Message, state: FSMContext):
-    if message.text not in ["🏗 Строим", "🔬 Исследуем"]:
-        return
+@dp.callback_query(Form.action)
+async def action(call: CallbackQuery, state: FSMContext):
+    action = "Строим" if call.data == "build" else "Исследуем"
 
     data = await state.get_data()
-    messages = data.get("messages", [])
+    msgs = data["messages"]
 
-    msg = await message.answer("⏳ Сколько осталось дней до завершения?")
-    messages.append(msg)
-    messages.append(message)
+    msg = await call.message.answer("⏳ Сколько осталось дней до завершения?")
+    msgs.append(msg)
 
-    await state.update_data(action=message.text, messages=messages)
-    await Form.waiting_days.set()
+    await state.update_data(action=action, messages=msgs)
+    await state.set_state(Form.days)
 
 
-@dp.message_handler(state=Form.waiting_days)
-async def save_days(message: types.Message, state: FSMContext):
+@dp.message(Form.days)
+async def days(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❗ Введи число без букв")
+        await message.answer("❗ Введи число")
         return
 
     data = await state.get_data()
-    messages = data.get("messages", [])
+    msgs = data["messages"]
 
     action = data["action"]
     days = int(message.text)
 
-    user = get_user(message.from_user.id)
+    user = await get_user(message.from_user.id)
 
-    add_task(message.from_user.id, action, days)
+    await add_task(message.from_user.id, action, days)
 
     final = await message.answer(
         f"✅ Я записал. Ты молодец!\n\n"
@@ -280,100 +238,103 @@ async def save_days(message: types.Message, state: FSMContext):
         f"⏳ {days} дней"
     )
 
-    await delete_messages(messages + [message])
+    await delete_messages(msgs + [message])
 
-    await state.finish()
+    await state.clear()
 
 
 # ================= DELETE TASKS =================
 
-@dp.message_handler(lambda m: m.text == "🗑 Удалить мои записи")
-async def delete_confirm(message: types.Message):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("✅ Да, удаляй, я создам новые")
-    kb.add("❌ Нет, я передумал.")
-
-    await message.answer("⚠️ Уверены?", reply_markup=kb)
-
-
-@dp.message_handler(lambda m: m.text == "✅ Да, удаляй, я создам новые")
-async def delete_yes(message: types.Message):
-    delete_tasks(message.from_user.id)
-    await message.answer("🧹 Удалено, можешь создавать записи снова.", reply_markup=main_menu())
+@dp.callback_query(F.data == "delete_tasks")
+async def del_tasks(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да", callback_data="yes_del")],
+        [InlineKeyboardButton(text="❌ Нет", callback_data="no_del")]
+    ])
+    await call.message.answer("⚠️ Уверены?", reply_markup=kb)
 
 
-@dp.message_handler(lambda m: m.text == "❌ Нет, я передумал.")
-async def delete_no(message: types.Message):
-    await message.answer("🤨 Ну и нахрена ты меня тревожишь?.", reply_markup=main_menu())
+@dp.callback_query(F.data == "yes_del")
+async def yes(call: CallbackQuery):
+    await delete_tasks(call.from_user.id)
+    await call.message.answer("🧹 Удалено")
 
 
-# ================= VIEW TASKS =================
+@dp.callback_query(F.data == "no_del")
+async def no(call: CallbackQuery):
+    await call.message.answer("🤨 Ну и нахрена ты меня тревожишь?.")
 
-@dp.message_handler(lambda m: m.text == "📜 Посмотреть все записи")
-async def show_tasks(message: types.Message):
-    tasks = get_all_tasks()
+
+# ================= ALL TASKS =================
+
+@dp.callback_query(F.data == "all_tasks")
+async def all_tasks(call: CallbackQuery):
+    tasks = await get_all_tasks()
 
     if not tasks:
-        await message.answer("😶 ...а нету ничего, давай исправим это? Создай запись.")
+        await call.message.answer("😶 ...а нету ничего, давай исправим это?")
         return
 
-    text = "📋 Список записей:\n\n"
-
+    text = "📋 Список:\n\n"
     for i, t in enumerate(tasks, 1):
         text += f"{i}) {t['nickname']} | {t['action_type']} | {t['days']} дней\n"
 
-    await message.answer(text)
+    await call.message.answer(text)
 
 
 # ================= EDIT NICK =================
 
-@dp.message_handler(lambda m: m.text == "✏️ Изменить никнейм")
-async def edit_nick(message: types.Message, state: FSMContext):
-    user = get_user(message.from_user.id)
+@dp.callback_query(F.data == "edit_nick")
+async def edit(call: CallbackQuery, state: FSMContext):
+    user = await get_user(call.from_user.id)
 
-    await message.answer(
-        f"🧾 Сейчас у тебя записан такой ник: \"{user['nickname']}\", на какой будем менять?"
+    await call.message.answer(
+        f"🧾 Сейчас ник: \"{user['nickname']}\"\nНа какой меняем?"
     )
 
-    await Form.editing_nick.set()
+    await state.set_state(Form.edit_nick)
 
 
-@dp.message_handler(state=Form.editing_nick)
-async def save_new_nick(message: types.Message, state: FSMContext):
-    update_nickname(message.from_user.id, message.text)
+@dp.message(Form.edit_nick)
+async def save_new(message: Message, state: FSMContext):
+    await update_nick(message.from_user.id, message.text)
 
     await message.answer(
-        f"✅ Отлично! Я переписал твой ник, теперь ты записан как: \"{message.text}\"",
+        f"✅ Теперь ты \"{message.text}\"",
         reply_markup=main_menu()
     )
 
-    await state.finish()
+    await state.clear()
 
 
 # ================= DELETE USER =================
 
-@dp.message_handler(lambda m: m.text == "💀 Удалиться из базы")
-async def delete_user_confirm(message: types.Message):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🔥 Да, удаляй при мне")
-    kb.add("🙏 Нет, простите, я больше так не буду.")
-
-    await message.answer("😈 Вот значит как? Ну а ты уверен?", reply_markup=kb)
-
-
-@dp.message_handler(lambda m: m.text == "🔥 Да, удаляй при мне")
-async def delete_user_yes(message: types.Message):
-    delete_user(message.from_user.id)
-
-    await message.answer("🕳 Твой выбор, твой путь, удалил, забыл, впервые тебя вижу.")
+@dp.callback_query(F.data == "delete_user")
+async def del_user(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Да", callback_data="yes_user")],
+        [InlineKeyboardButton(text="🙏 Нет", callback_data="no_user")]
+    ])
+    await call.message.answer("😈 Уверен?", reply_markup=kb)
 
 
-@dp.message_handler(lambda m: m.text == "🙏 Нет, простите, я больше так не буду.")
-async def delete_user_no(message: types.Message):
-    await message.answer("😤 Вот и знай своё место и больше так не делай!", reply_markup=main_menu())
+@dp.callback_query(F.data == "yes_user")
+async def yes_user(call: CallbackQuery):
+    await delete_user(call.from_user.id)
+    await call.message.answer("🕳 Удалил. Кто ты?")
 
 
-# ================= START =================
+@dp.callback_query(F.data == "no_user")
+async def no_user(call: CallbackQuery):
+    await call.message.answer("😤 Вот и правильно")
+
+
+# ================= RUN =================
+
+async def main():
+    await init_db()
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())

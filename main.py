@@ -54,11 +54,13 @@ def new_state(uid, chat_id):
         "step": None,
         "chat": chat_id,
         "msgs": [],
+        "last_msg": None,
         "time": datetime.utcnow()
     }
 
 def track(uid, msg):
     user_states[uid]["msgs"].append((msg.chat.id, msg.message_id))
+    user_states[uid]["last_msg"] = msg.message_id
 
 async def clear(uid):
     for chat_id, msg_id in user_states.get(uid, {}).get("msgs", []):
@@ -192,6 +194,10 @@ async def cb(c: CallbackQuery):
     if not st:
         return
 
+    # ❗ защита от старых кнопок
+    if c.message.message_id != st.get("last_msg"):
+        return
+
     if timeout(uid):
         await clear(uid)
         user_states.pop(uid, None)
@@ -199,32 +205,50 @@ async def cb(c: CallbackQuery):
 
     st["time"] = datetime.utcnow()
 
-    # ===== СОЗДАНИЕ =====
+    # ===== CREATE =====
     if c.data == "create" and st["step"] == "menu":
 
         cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=%s", (uid,))
         if cursor.fetchone()[0] >= 2:
             return await c.message.answer("⚠️ У тебя уже есть 2 записи")
 
+        await c.message.delete()
+
         st["step"] = "type"
-        m = await c.message.answer("❓ Что делаем?", reply_markup=type_kb())
+        m = await bot.send_message(st["chat"], "❓ Что делаем?", reply_markup=type_kb())
         track(uid, m)
 
     elif c.data.startswith("type_") and st["step"] == "type":
+
+        await c.message.delete()
+
         st["type"] = "Стройка" if "build" in c.data else "Исследование"
         st["step"] = "range"
 
-        m = await c.message.answer("📅 Сколько осталось дней до завершения?", reply_markup=range_kb())
+        m = await bot.send_message(
+            st["chat"],
+            "📅 Сколько осталось дней до завершения?",
+            reply_markup=range_kb()
+        )
         track(uid, m)
 
     elif c.data.startswith("r_") and st["step"] == "range":
+
+        await c.message.delete()
+
         st["range"] = int(c.data.split("_")[1])
         st["step"] = "day"
 
-        m = await c.message.answer("📆 Выбери день:", reply_markup=days_kb(st["range"]))
+        m = await bot.send_message(
+            st["chat"],
+            "📆 Выбери день:",
+            reply_markup=days_kb(st["range"])
+        )
         track(uid, m)
 
     elif c.data.startswith("d_") and st["step"] == "day":
+
+        await c.message.delete()
 
         days = int(c.data.split("_")[1])
         nick = await get_nick(uid)
@@ -236,57 +260,68 @@ async def cb(c: CallbackQuery):
 
         await clear(uid)
 
-        m = await c.message.answer("🎉 Запись создана. Ты молодец!")
+        m = await bot.send_message(
+            st["chat"],
+            "🎉 Запись создана. Ты молодец!"
+        )
+
         asyncio.create_task(delete_after(m, 60))
 
         user_states.pop(uid, None)
 
-    # ===== ВСЕ ЗАПИСИ =====
+    # ===== ALL =====
     elif c.data == "all":
+
         cursor.execute("SELECT name,type,days FROM tasks")
         rows = cursor.fetchall()
 
+        await clear(uid)
+
         if not rows:
-            return await c.message.answer("📭 Созданных записей нет")
+            return await bot.send_message(st["chat"], "📭 Записей нет")
 
         text = "📊 Все записи:\n\n"
         for i, r in enumerate(rows, 1):
             text += f"{i}) {r[0]} \\ {r[1]} \\ Осталось {r[2]} дней\n"
 
-        await clear(uid)
-        await c.message.answer(text)
+        await bot.send_message(st["chat"], text)
 
-    # ===== УДАЛЕНИЕ =====
+    # ===== DELETE =====
     elif c.data == "del_all":
+
         cursor.execute("DELETE FROM tasks WHERE user_id=%s", (uid,))
         await clear(uid)
 
-        m = await c.message.answer("🗑 Удалено, можешь создавать заново")
+        m = await bot.send_message(st["chat"], "🗑 Удалено")
         asyncio.create_task(delete_after(m, 60))
 
         user_states.pop(uid, None)
 
-    # ===== СМЕНА НИКА =====
+    # ===== EDIT =====
     elif c.data == "edit":
+
         nick = await get_nick(uid)
 
+        await c.message.delete()
+
         st["step"] = "edit"
-        m = await c.message.answer(f"✏️ Сейчас твой ник: {nick}\nВведи новый:")
+        m = await bot.send_message(st["chat"], f"✏️ Сейчас ник: {nick}\nВведи новый:")
         track(uid, m)
 
-    # ===== УДАЛИТЬ СЕБЯ =====
+    # ===== DELETE USER =====
     elif c.data == "delete_me":
+
         cursor.execute("DELETE FROM users WHERE user_id=%s", (uid,))
         cursor.execute("DELETE FROM tasks WHERE user_id=%s", (uid,))
 
         await clear(uid)
 
-        m = await c.message.answer("💀 Я тебя забыл...")
+        m = await bot.send_message(st["chat"], "💀 Я тебя забыл...")
         asyncio.create_task(delete_after(m, 60))
 
         user_states.pop(uid, None)
 
-# ================= DELETE =================
+# ================= DELETE AFTER =================
 
 async def delete_after(msg, sec):
     await asyncio.sleep(sec)

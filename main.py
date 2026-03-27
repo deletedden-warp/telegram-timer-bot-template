@@ -1,13 +1,13 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -58,23 +58,26 @@ class Form(StatesGroup):
     edit_nick = State()
 
 
-# ================= UTILS =================
+# ================= MESSAGE TRACKING =================
 
-async def delete_messages(messages):
-    await asyncio.sleep(1)
-    for msg in messages:
+async def add_msg(state: FSMContext, msg):
+    data = await state.get_data()
+    msgs = data.get("messages", [])
+    msgs.append(msg)
+    await state.update_data(messages=msgs)
+
+
+async def cleanup(state: FSMContext):
+    data = await state.get_data()
+    msgs = data.get("messages", [])
+
+    for msg in msgs:
         try:
             await msg.delete()
         except:
             pass
 
-
-async def timeout(state: FSMContext, messages):
-    await asyncio.sleep(180)
-    data = await state.get_data()
-    if data.get("active"):
-        await state.clear()
-        await delete_messages(messages)
+    await state.update_data(messages=[])
 
 
 # ================= DB FUNCS =================
@@ -153,16 +156,22 @@ def main_menu():
 
 # ================= START =================
 
-@dp.message(F.text == "/menu")
+@dp.message(Command("menu"))
 async def menu(message: Message, state: FSMContext):
+    await cleanup(state)  # 💥 чистим старые сообщения
+
     user = await get_user(message.from_user.id)
 
     if not user:
-        await message.answer("⚔️ Кто ты воин? Представься")
+        msg = await message.answer("⚔️ Кто ты воин? Представься")
+        await add_msg(state, msg)
+        await add_msg(state, message)
+
         await state.set_state(Form.nickname)
         return
 
-    await message.answer("🧠 Что будем делать?", reply_markup=main_menu())
+    msg = await message.answer("🧠 Что будем делать?", reply_markup=main_menu())
+    await add_msg(state, msg)
 
 
 # ================= REG =================
@@ -171,8 +180,13 @@ async def menu(message: Message, state: FSMContext):
 async def reg(message: Message, state: FSMContext):
     await create_user(message.from_user.id, message.text)
 
-    await message.answer(f"👋 Приветствую тебя \"{message.text}\"!")
-    await message.answer("🧠 Что будем делать?", reply_markup=main_menu())
+    await add_msg(state, message)
+
+    msg1 = await message.answer(f"👋 Приветствую тебя \"{message.text}\"!")
+    msg2 = await message.answer("🧠 Что будем делать?", reply_markup=main_menu())
+
+    await add_msg(state, msg1)
+    await add_msg(state, msg2)
 
     await state.clear()
 
@@ -193,10 +207,7 @@ async def create(call: CallbackQuery, state: FSMContext):
     ])
 
     msg = await call.message.answer("⚙️ Что делаем?", reply_markup=kb)
-
-    await state.update_data(messages=[msg], active=True)
-
-    asyncio.create_task(timeout(state, [msg]))
+    await add_msg(state, msg)
 
     await state.set_state(Form.action)
 
@@ -205,13 +216,10 @@ async def create(call: CallbackQuery, state: FSMContext):
 async def action(call: CallbackQuery, state: FSMContext):
     action = "Строим" if call.data == "build" else "Исследуем"
 
-    data = await state.get_data()
-    msgs = data["messages"]
-
     msg = await call.message.answer("⏳ Сколько осталось дней до завершения?")
-    msgs.append(msg)
+    await add_msg(state, msg)
 
-    await state.update_data(action=action, messages=msgs)
+    await state.update_data(action=action)
     await state.set_state(Form.days)
 
 
@@ -221,8 +229,9 @@ async def days(message: Message, state: FSMContext):
         await message.answer("❗ Введи число")
         return
 
+    await add_msg(state, message)
+
     data = await state.get_data()
-    msgs = data["messages"]
 
     action = data["action"]
     days = int(message.text)
@@ -231,102 +240,16 @@ async def days(message: Message, state: FSMContext):
 
     await add_task(message.from_user.id, action, days)
 
-    final = await message.answer(
+    await cleanup(state)  # 💥 удаляем ВСЁ
+
+    await message.answer(
         f"✅ Я записал. Ты молодец!\n\n"
         f"👤 {user['nickname']}\n"
         f"⚙️ {action}\n"
         f"⏳ {days} дней"
     )
 
-    await delete_messages(msgs + [message])
-
     await state.clear()
-
-
-# ================= DELETE TASKS =================
-
-@dp.callback_query(F.data == "delete_tasks")
-async def del_tasks(call: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да", callback_data="yes_del")],
-        [InlineKeyboardButton(text="❌ Нет", callback_data="no_del")]
-    ])
-    await call.message.answer("⚠️ Уверены?", reply_markup=kb)
-
-
-@dp.callback_query(F.data == "yes_del")
-async def yes(call: CallbackQuery):
-    await delete_tasks(call.from_user.id)
-    await call.message.answer("🧹 Удалено")
-
-
-@dp.callback_query(F.data == "no_del")
-async def no(call: CallbackQuery):
-    await call.message.answer("🤨 Ну и нахрена ты меня тревожишь?.")
-
-
-# ================= ALL TASKS =================
-
-@dp.callback_query(F.data == "all_tasks")
-async def all_tasks(call: CallbackQuery):
-    tasks = await get_all_tasks()
-
-    if not tasks:
-        await call.message.answer("😶 ...а нету ничего, давай исправим это?")
-        return
-
-    text = "📋 Список:\n\n"
-    for i, t in enumerate(tasks, 1):
-        text += f"{i}) {t['nickname']} | {t['action_type']} | {t['days']} дней\n"
-
-    await call.message.answer(text)
-
-
-# ================= EDIT NICK =================
-
-@dp.callback_query(F.data == "edit_nick")
-async def edit(call: CallbackQuery, state: FSMContext):
-    user = await get_user(call.from_user.id)
-
-    await call.message.answer(
-        f"🧾 Сейчас ник: \"{user['nickname']}\"\nНа какой меняем?"
-    )
-
-    await state.set_state(Form.edit_nick)
-
-
-@dp.message(Form.edit_nick)
-async def save_new(message: Message, state: FSMContext):
-    await update_nick(message.from_user.id, message.text)
-
-    await message.answer(
-        f"✅ Теперь ты \"{message.text}\"",
-        reply_markup=main_menu()
-    )
-
-    await state.clear()
-
-
-# ================= DELETE USER =================
-
-@dp.callback_query(F.data == "delete_user")
-async def del_user(call: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 Да", callback_data="yes_user")],
-        [InlineKeyboardButton(text="🙏 Нет", callback_data="no_user")]
-    ])
-    await call.message.answer("😈 Уверен?", reply_markup=kb)
-
-
-@dp.callback_query(F.data == "yes_user")
-async def yes_user(call: CallbackQuery):
-    await delete_user(call.from_user.id)
-    await call.message.answer("🕳 Удалил. Кто ты?")
-
-
-@dp.callback_query(F.data == "no_user")
-async def no_user(call: CallbackQuery):
-    await call.message.answer("😤 Вот и правильно")
 
 
 # ================= RUN =================

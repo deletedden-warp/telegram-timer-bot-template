@@ -57,17 +57,17 @@ async def delete_safe(chat_id, msg_id):
     except:
         pass
 
-def clear_msgs(uid):
-    if uid in user_states:
-        for m in user_states[uid].get("msgs", []):
-            asyncio.create_task(delete_safe(m["chat"], m["id"]))
-        user_states[uid]["msgs"] = []
+async def auto_delete(chat_id, msg_id, delay=30):
+    await asyncio.sleep(delay)
+    await delete_safe(chat_id, msg_id)
 
-def save_msg(uid, msg):
-    user_states.setdefault(uid, {}).setdefault("msgs", []).append({
-        "chat": msg.chat.id,
-        "id": msg.message_id
-    })
+def track_msg(uid, msg):
+    user_states.setdefault(uid, {}).setdefault("msgs", []).append((msg.chat.id, msg.message_id))
+
+async def clear_all(uid):
+    for chat_id, msg_id in user_states.get(uid, {}).get("msgs", []):
+        await delete_safe(chat_id, msg_id)
+    user_states[uid]["msgs"] = []
 
 async def get_nick(uid):
     cursor.execute("SELECT nickname FROM users WHERE user_id=%s", (uid,))
@@ -89,6 +89,7 @@ def type_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("🏗 Строим", callback_data="type_build"))
     kb.add(InlineKeyboardButton("🔬 Исследуем", callback_data="type_research"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_menu"))
     return kb
 
 def range_kb():
@@ -101,18 +102,21 @@ def range_kb():
         InlineKeyboardButton("61-90", callback_data="r_61"),
         InlineKeyboardButton("91-120", callback_data="r_91"),
     )
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_type"))
     return kb
 
 def days_kb(start):
     kb = InlineKeyboardMarkup(row_width=5)
     for i in range(start, start + 30):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"d_{i}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_range"))
     return kb
 
 def hours_kb():
     kb = InlineKeyboardMarkup(row_width=6)
     for i in range(1, 24):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"h_{i}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_day"))
     return kb
 
 # ================= MENU =================
@@ -125,12 +129,12 @@ async def menu(msg: types.Message):
 
     if not nick:
         user_states[uid] = {"step": "nick"}
-        m = await msg.answer("⚔️ Кто ты воин? Введи ник:")
-        save_msg(uid, m)
+        m = await msg.answer("⚔️ Кто ты воин? Введи свой ник:")
+        track_msg(uid, m)
         return
 
     m = await msg.answer("📋 Меню:", reply_markup=menu_kb())
-    save_msg(uid, m)
+    track_msg(uid, m)
 
 # ================= TEXT =================
 
@@ -142,6 +146,7 @@ async def text(msg: types.Message):
     if not st:
         return
 
+    # регистрация
     if st.get("step") == "nick":
         cursor.execute("""
         INSERT INTO users (user_id, nickname)
@@ -149,77 +154,81 @@ async def text(msg: types.Message):
         ON CONFLICT (user_id) DO UPDATE SET nickname = EXCLUDED.nickname
         """, (uid, msg.text.strip()))
 
-        clear_msgs(uid)
+        await clear_all(uid)
 
-        m = await msg.answer("✅ Готово!", reply_markup=menu_kb())
-        save_msg(uid, m)
+        m = await msg.answer("✅ Отлично! Теперь выбери действие:", reply_markup=menu_kb())
+        track_msg(uid, m)
+        return
+
+    # смена ника
+    if st.get("step") == "edit_nick":
+        cursor.execute("UPDATE users SET nickname=%s WHERE user_id=%s",
+                       (msg.text.strip(), uid))
+
+        await clear_all(uid)
+
+        m = await msg.answer(f"✅ Теперь ты: {msg.text.strip()}")
+        track_msg(uid, m)
         return
 
 # ================= CREATE =================
 
 @dp.callback_query_handler(Text(equals="create"))
 async def create(c: CallbackQuery):
+    await c.answer()
     uid = c.from_user.id
 
     cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=%s", (uid,))
     if cursor.fetchone()[0] >= 2:
         return await c.message.answer("⚠️ У тебя уже 2 записи")
 
-    clear_msgs(uid)
-
-    user_states[uid] = {}
+    user_states[uid] = {"step": "type", "msgs": []}
 
     m = await c.message.answer("❓ Что делаем?", reply_markup=type_kb())
-    save_msg(uid, m)
+    track_msg(uid, m)
 
-# ================= TYPE =================
-
+# TYPE
 @dp.callback_query_handler(Text(startswith="type_"))
 async def type_handler(c: CallbackQuery):
+    await c.answer()
     uid = c.from_user.id
 
     user_states[uid]["type"] = "🏗 Строим" if "build" in c.data else "🔬 Исследуем"
 
-    clear_msgs(uid)
-
     m = await c.message.answer("📅 Выбери диапазон:", reply_markup=range_kb())
-    save_msg(uid, m)
+    track_msg(uid, m)
 
-# ================= RANGE =================
-
+# RANGE
 @dp.callback_query_handler(Text(startswith="r_"))
 async def range_handler(c: CallbackQuery):
+    await c.answer()
     uid = c.from_user.id
 
     start = int(c.data.split("_")[1])
 
-    clear_msgs(uid)
-
     m = await c.message.answer("📆 Выбери день:", reply_markup=days_kb(start))
-    save_msg(uid, m)
+    track_msg(uid, m)
 
-# ================= DAY =================
-
+# DAY
 @dp.callback_query_handler(Text(startswith="d_"))
 async def day_handler(c: CallbackQuery):
+    await c.answer()
     uid = c.from_user.id
 
     user_states[uid]["days"] = int(c.data.split("_")[1])
 
-    clear_msgs(uid)
-
     m = await c.message.answer("⏳ Выбери часы:", reply_markup=hours_kb())
-    save_msg(uid, m)
+    track_msg(uid, m)
 
-# ================= HOURS =================
-
+# HOURS (ФИНАЛ — теперь стабилен)
 @dp.callback_query_handler(Text(startswith="h_"))
 async def hours_handler(c: CallbackQuery):
+    await c.answer()
     uid = c.from_user.id
     st = user_states.get(uid)
 
     if not st:
-        return await c.answer("Ошибка", show_alert=True)
+        return
 
     hours = int(c.data.split("_")[1])
     total = st["days"] * 24 + hours
@@ -231,9 +240,10 @@ async def hours_handler(c: CallbackQuery):
     VALUES (%s,%s,%s,%s)
     """, (uid, nick, st["type"], total))
 
-    clear_msgs(uid)
+    await clear_all(uid)
 
-    await c.message.answer("🎉 Запись создана!")
+    m = await c.message.answer("🎉 Запись создана! Ты красавчик!")
+    track_msg(uid, m)
 
     user_states.pop(uid, None)
 

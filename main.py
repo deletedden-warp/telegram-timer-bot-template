@@ -67,14 +67,14 @@ class SetNick(StatesGroup):
 # ================= UI =================
 
 def menu_kb():
-    kb = InlineKeyboardMarkup()
+    kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("➕ Создать", callback_data="menu_create"),
-        InlineKeyboardButton("📋 Мои записи", callback_data="menu_my")
+        InlineKeyboardButton("📋 Мои записи", callback_data="menu_my"),
     )
     kb.add(
         InlineKeyboardButton("❌ Удалить все", callback_data="menu_del"),
-        InlineKeyboardButton("✏️ Изменить ник", callback_data="menu_nick")
+        InlineKeyboardButton("✏️ Изменить ник", callback_data="menu_nick"),
     )
     return kb
 
@@ -124,8 +124,15 @@ async def get_nick(user_id):
 # ================= MENU =================
 
 @dp.message_handler(commands=["menu"])
-async def menu(msg: types.Message):
-    await msg.answer("Меню:", reply_markup=menu_kb())
+async def menu(msg: types.Message, state: FSMContext):
+    await state.finish()  # сброс зависших состояний
+    await delete_safe(msg.chat.id, msg.message_id)
+
+    await bot.send_message(
+        msg.chat.id,
+        "📋 Меню управления:",
+        reply_markup=menu_kb()
+    )
 
 @dp.callback_query_handler(lambda c: c.data.startswith("menu"))
 async def menu_actions(c: CallbackQuery, state: FSMContext):
@@ -147,9 +154,6 @@ async def menu_actions(c: CallbackQuery, state: FSMContext):
 
 @dp.message_handler(commands=["create"])
 async def create_cmd(msg: types.Message, state: FSMContext):
-    if msg.chat.type == "private":
-        return await msg.answer("Используй в группе")
-
     await delete_safe(msg.chat.id, msg.message_id)
 
     cursor.execute("SELECT COUNT(*) FROM tasks WHERE user_id=%s",

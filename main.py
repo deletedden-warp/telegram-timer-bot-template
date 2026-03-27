@@ -6,6 +6,7 @@ import psycopg2
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import *
 from aiogram.utils import executor
+from aiogram.dispatcher.filters import Text
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -88,7 +89,6 @@ def type_kb():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("🏗 Строим", callback_data="type_build"))
     kb.add(InlineKeyboardButton("🔬 Исследуем", callback_data="type_research"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_menu"))
     return kb
 
 def range_kb():
@@ -101,21 +101,18 @@ def range_kb():
         InlineKeyboardButton("61-90", callback_data="r_61"),
         InlineKeyboardButton("91-120", callback_data="r_91"),
     )
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_type"))
     return kb
 
 def days_kb(start):
     kb = InlineKeyboardMarkup(row_width=5)
     for i in range(start, start + 30):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"d_{i}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_range"))
     return kb
 
 def hours_kb():
     kb = InlineKeyboardMarkup(row_width=6)
     for i in range(1, 24):
         kb.insert(InlineKeyboardButton(str(i), callback_data=f"h_{i}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_day"))
     return kb
 
 # ================= MENU =================
@@ -128,7 +125,7 @@ async def menu(msg: types.Message):
 
     if not nick:
         user_states[uid] = {"step": "nick"}
-        m = await msg.answer("⚔️ Кто ты воин? Введи свой ник:")
+        m = await msg.answer("⚔️ Кто ты воин? Введи ник:")
         save_msg(uid, m)
         return
 
@@ -154,23 +151,13 @@ async def text(msg: types.Message):
 
         clear_msgs(uid)
 
-        m = await msg.answer("✅ Отлично! Выбирай:", reply_markup=menu_kb())
+        m = await msg.answer("✅ Готово!", reply_markup=menu_kb())
         save_msg(uid, m)
         return
 
-    if st.get("step") == "edit_nick":
-        cursor.execute("UPDATE users SET nickname=%s WHERE user_id=%s",
-                       (msg.text.strip(), uid))
+# ================= CREATE =================
 
-        clear_msgs(uid)
-
-        m = await msg.answer(f"✅ Теперь ты: {msg.text.strip()}")
-        save_msg(uid, m)
-        return
-
-# ================= CREATE FLOW =================
-
-@dp.callback_query_handler(lambda c: c.data == "create")
+@dp.callback_query_handler(Text(equals="create"))
 async def create(c: CallbackQuery):
     uid = c.from_user.id
 
@@ -180,13 +167,14 @@ async def create(c: CallbackQuery):
 
     clear_msgs(uid)
 
-    user_states[uid] = {"step": "type"}
+    user_states[uid] = {}
 
     m = await c.message.answer("❓ Что делаем?", reply_markup=type_kb())
     save_msg(uid, m)
 
-# ===== TYPE =====
-@dp.callback_query_handler(lambda c: c.data.startswith("type_"))
+# ================= TYPE =================
+
+@dp.callback_query_handler(Text(startswith="type_"))
 async def type_handler(c: CallbackQuery):
     uid = c.from_user.id
 
@@ -194,11 +182,12 @@ async def type_handler(c: CallbackQuery):
 
     clear_msgs(uid)
 
-    m = await c.message.answer("📅 Сколько дней?", reply_markup=range_kb())
+    m = await c.message.answer("📅 Выбери диапазон:", reply_markup=range_kb())
     save_msg(uid, m)
 
-# ===== RANGE =====
-@dp.callback_query_handler(lambda c: c.data.startswith("r_"))
+# ================= RANGE =================
+
+@dp.callback_query_handler(Text(startswith="r_"))
 async def range_handler(c: CallbackQuery):
     uid = c.from_user.id
 
@@ -209,8 +198,9 @@ async def range_handler(c: CallbackQuery):
     m = await c.message.answer("📆 Выбери день:", reply_markup=days_kb(start))
     save_msg(uid, m)
 
-# ===== DAY =====
-@dp.callback_query_handler(lambda c: c.data.startswith("d_"))
+# ================= DAY =================
+
+@dp.callback_query_handler(Text(startswith="d_"))
 async def day_handler(c: CallbackQuery):
     uid = c.from_user.id
 
@@ -221,14 +211,15 @@ async def day_handler(c: CallbackQuery):
     m = await c.message.answer("⏳ Выбери часы:", reply_markup=hours_kb())
     save_msg(uid, m)
 
-# ===== HOURS (ФИКС) =====
-@dp.callback_query_handler(lambda c: c.data.startswith("h_"))
+# ================= HOURS =================
+
+@dp.callback_query_handler(Text(startswith="h_"))
 async def hours_handler(c: CallbackQuery):
     uid = c.from_user.id
     st = user_states.get(uid)
 
-    if not st or "days" not in st or "type" not in st:
-        return await c.answer("Ошибка, начни заново", show_alert=True)
+    if not st:
+        return await c.answer("Ошибка", show_alert=True)
 
     hours = int(c.data.split("_")[1])
     total = st["days"] * 24 + hours
@@ -242,8 +233,7 @@ async def hours_handler(c: CallbackQuery):
 
     clear_msgs(uid)
 
-    m = await c.message.answer("🎉 Запись создана! Ты молодец!")
-    save_msg(uid, m)
+    await c.message.answer("🎉 Запись создана!")
 
     user_states.pop(uid, None)
 

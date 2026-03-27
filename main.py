@@ -53,7 +53,6 @@ CREATE TABLE IF NOT EXISTS tasks (
 """)
 
 # ================= STATE =================
-
 user_states = {}
 
 # ================= HELPERS =================
@@ -84,23 +83,21 @@ async def get_nick(user_id):
     r = cursor.fetchone()
     return r[0] if r else None
 
-def progress_bar(percent):
-    total = 10
-    filled = int(percent / 10)
-    return "█" * filled + "░" * (total - filled)
+async def force_nick(msg):
+    m = await safe_send(msg.chat.id, "Введите свой ник в игре", thread_id=msg.message_thread_id)
+    user_states[msg.from_user.id] = {
+        "step": "wait_nick_first",
+        "thread": msg.message_thread_id
+    }
 
-async def reset_user(uid, chat_id, thread_id):
-    user_states.pop(uid, None)
-    await safe_send(chat_id, "⏱ Время вышло. Начни заново:", menu_kb(), thread_id)
+    asyncio.create_task(nick_timeout(msg.from_user.id, msg.chat.id, msg.message_thread_id))
 
-# ================= TIMEOUT =================
-
-async def start_timeout(uid, chat_id, thread_id):
-    await asyncio.sleep(300)  # 5 минут
-
+async def nick_timeout(uid, chat_id, thread_id):
+    await asyncio.sleep(60)
     st = user_states.get(uid)
-    if st and st.get("active"):
-        await reset_user(uid, chat_id, thread_id)
+    if st and st.get("step") in ["wait_nick_first", "wait_nick_edit"]:
+        user_states.pop(uid, None)
+        await safe_send(chat_id, "⏱ Время вышло. Попробуй снова", thread_id=thread_id)
 
 # ================= UI =================
 
@@ -112,7 +109,7 @@ def menu_kb():
     )
     kb.add(
         InlineKeyboardButton("📊 Все записи", callback_data="all"),
-        InlineKeyboardButton("❌ Удалить все", callback_data="del_all"),
+        InlineKeyboardButton("❌ Удалить мои записи", callback_data="del_all"),
     )
     kb.add(
         InlineKeyboardButton("✏️ Изменить ник", callback_data="set_nick"),
@@ -155,14 +152,11 @@ def del_kb(tid):
 async def menu(msg: types.Message):
     await delete_safe(msg.chat.id, msg.message_id)
 
-    m = await safe_send(
-        msg.chat.id,
-        "📋 Меню:",
-        menu_kb(),
-        msg.message_thread_id,
-        auto_del=None
-    )
+    nick = await get_nick(msg.from_user.id)
+    if not nick:
+        return await force_nick(msg)
 
+    m = await safe_send(msg.chat.id, "📋 Меню:", menu_kb(), msg.message_thread_id, auto_del=None)
     asyncio.create_task(auto_delete(msg.chat.id, m.message_id, 120))
 
 # ================= CALLBACK =================
@@ -170,27 +164,27 @@ async def menu(msg: types.Message):
 @dp.callback_query_handler(lambda c: True)
 async def callbacks(c: CallbackQuery):
     uid = c.from_user.id
-    data = c.data
     thread_id = c.message.message_thread_id
+    data = c.data
 
     await c.answer()
 
+    nick = await get_nick(uid)
+    if not nick:
+        return await force_nick(c.message)
+
     # ===== CREATE =====
     if data == "create":
-        nick = await get_nick(uid)
-
-        user_states[uid] = {"active": True, "thread": thread_id}
-        asyncio.create_task(start_timeout(uid, c.message.chat.id, thread_id))
-
-        if not nick:
-            user_states[uid]["step"] = "wait_nick_create"
-            await safe_send(c.message.chat.id, "Введи ник:", thread_id=thread_id)
-            return
+        user_states[uid] = {
+            "active": True,
+            "thread": thread_id
+        }
+        asyncio.create_task(create_timeout(uid, c.message.chat.id, thread_id))
 
         await safe_send(c.message.chat.id, "Что делаем?", type_kb(), thread_id)
         return
 
-    # защита от смены темы
+    # защита темы
     if uid in user_states and user_states[uid].get("thread") != thread_id:
         return
 
@@ -212,16 +206,15 @@ async def callbacks(c: CallbackQuery):
         await safe_send(c.message.chat.id, "Сколько часов?", hours_kb(), thread_id)
         return
 
-    # ===== HOURS =====
+    # ===== HOURS (FIXED) =====
     if data.startswith("hour_"):
         st = user_states.get(uid)
-        if not st:
-            return
+        if not st or "days" not in st or "type" not in st:
+            return await safe_send(c.message.chat.id, "Ошибка. Начни заново через меню", thread_id=thread_id)
 
         hours = int(data.split("_")[1])
         days = st["days"]
         total = days * 24 + hours
-        nick = await get_nick(uid)
 
         cursor.execute("""
         INSERT INTO tasks (user_id,name,type,hours_left,delete_at,chat_id,message_id,thread_id)
@@ -245,14 +238,30 @@ async def callbacks(c: CallbackQuery):
         user_states.pop(uid, None)
         return
 
-    # ===== DELETE ALL =====
-    if data == "del_all":
-        cursor.execute("SELECT chat_id,message_id FROM tasks WHERE user_id=%s", (uid,))
-        for chat_id, msg_id in cursor.fetchall():
-            await delete_safe(chat_id, msg_id)
+    # ===== MY =====
+    if data == "my":
+        cursor.execute("SELECT name,type,hours_left FROM tasks WHERE user_id=%s", (uid,))
+        rows = cursor.fetchall()
 
-        cursor.execute("DELETE FROM tasks WHERE user_id=%s", (uid,))
-        await safe_send(c.message.chat.id, "Удалено ✅", thread_id=thread_id)
+        if not rows:
+            return await safe_send(c.message.chat.id, "Созданных записей нет, создай свою", thread_id=thread_id)
+
+        text = "\n".join([f"{n} | {t} | {h//24}д {h%24}ч" for n,t,h in rows])
+        await safe_send(c.message.chat.id, text, thread_id=thread_id)
+        return
+
+    # ===== SET NICK =====
+    if data == "set_nick":
+        current = await get_nick(uid)
+        user_states[uid] = {"step": "wait_nick_edit", "thread": thread_id}
+
+        await safe_send(
+            c.message.chat.id,
+            f"Сейчас твой никнейм такой: {current}\nВведи новый ник:",
+            thread_id=thread_id
+        )
+
+        asyncio.create_task(nick_timeout(uid, c.message.chat.id, thread_id))
         return
 
 # ================= TEXT =================
@@ -268,7 +277,7 @@ async def text(msg: types.Message):
     if st.get("thread") != msg.message_thread_id:
         return
 
-    if st.get("step") == "wait_nick_create":
+    if st.get("step") in ["wait_nick_first", "wait_nick_edit"]:
         cursor.execute("""
         INSERT INTO users (user_id, nickname)
         VALUES (%s, %s)
@@ -276,7 +285,16 @@ async def text(msg: types.Message):
         """, (uid, msg.text.strip()))
 
         await safe_send(msg.chat.id, "Ник сохранён ✅", thread_id=msg.message_thread_id)
-        await safe_send(msg.chat.id, "Что делаем?", type_kb(), msg.message_thread_id)
+        user_states.pop(uid, None)
+
+# ================= TIMEOUT =================
+
+async def create_timeout(uid, chat_id, thread_id):
+    await asyncio.sleep(300)
+    st = user_states.get(uid)
+    if st and st.get("active"):
+        user_states.pop(uid, None)
+        await safe_send(chat_id, "⏱ Время вышло. Начни заново", menu_kb(), thread_id)
 
 # ================= UPDATE =================
 

@@ -103,6 +103,13 @@ async def get_nick(user_id):
     r = cursor.fetchone()
     return r[0] if r else None
 
+# ================= CANCEL =================
+
+@dp.message_handler(commands=["cancel"], state="*")
+async def cancel(msg: types.Message, state: FSMContext):
+    await state.finish()
+    await msg.answer("Действие отменено")
+
 # ================= CREATE =================
 
 @dp.message_handler(commands=["create"])
@@ -124,7 +131,12 @@ async def create_cmd(msg: types.Message):
     await msg.answer("Что делаем?", reply_markup=type_kb())
     await CreateTask.type.set()
 
-# ================= NICK =================
+# ================= EDIT NICK =================
+
+@dp.message_handler(commands=["edit_nick"])
+async def edit_nick(msg: types.Message):
+    await msg.answer("Введи новый ник:")
+    await SetNick.nick.set()
 
 @dp.message_handler(state=SetNick.nick)
 async def save_nick(msg: types.Message, state: FSMContext):
@@ -135,11 +147,7 @@ async def save_nick(msg: types.Message, state: FSMContext):
     """, (msg.from_user.id, msg.text))
 
     await msg.answer("Ник сохранён ✅")
-
     await state.finish()
-
-    await msg.answer("Что делаем?", reply_markup=type_kb())
-    await CreateTask.type.set()
 
 # ================= TYPE =================
 
@@ -204,6 +212,54 @@ async def hours_cb(c: CallbackQuery, state: FSMContext):
 
     await c.message.delete()
     await state.finish()
+
+# ================= DELETE ONE =================
+
+@dp.callback_query_handler(lambda c: c.data.startswith("del"))
+async def del_task(c: CallbackQuery):
+    await c.answer()
+
+    tid = int(c.data.split(":")[1])
+
+    cursor.execute("SELECT chat_id,message_id,user_id FROM tasks WHERE id=%s", (tid,))
+    t = cursor.fetchone()
+
+    if not t or t[2] != c.from_user.id:
+        return await c.answer("Не твоя запись", show_alert=True)
+
+    await bot.delete_message(t[0], t[1])
+    cursor.execute("DELETE FROM tasks WHERE id=%s", (tid,))
+
+# ================= MY =================
+
+@dp.message_handler(commands=["my"])
+async def my(msg: types.Message):
+    cursor.execute("SELECT name,type,hours_left FROM tasks WHERE user_id=%s",
+                   (msg.from_user.id,))
+    rows = cursor.fetchall()
+
+    if not rows:
+        return await msg.answer("У тебя нет записей")
+
+    text = "\n".join([f"{n} | {t} | {h//24}д {h%24}ч" for n,t,h in rows])
+    await msg.answer(text)
+
+# ================= DELETE ALL =================
+
+@dp.message_handler(commands=["delete_all"])
+async def del_all(msg: types.Message):
+    cursor.execute("SELECT chat_id,message_id FROM tasks WHERE user_id=%s",
+                   (msg.from_user.id,))
+    for chat_id, msg_id in cursor.fetchall():
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except:
+            pass
+
+    cursor.execute("DELETE FROM tasks WHERE user_id=%s",
+                   (msg.from_user.id,))
+
+    await msg.answer("Все записи удалены ✅")
 
 # ================= UPDATE =================
 

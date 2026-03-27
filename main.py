@@ -139,7 +139,8 @@ async def save_nick(msg: types.Message, state: FSMContext):
 
     await msg.answer("Ник сохранён ✅")
 
-    # продолжаем создание
+    await state.finish()  # ВАЖНЫЙ ФИКС
+
     await msg.answer("Что делаем?", reply_markup=type_kb())
     await CreateTask.type.set()
 

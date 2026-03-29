@@ -94,7 +94,7 @@ def action_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🏗 Строим"), KeyboardButton(text="🔬 Исследуем")],
-            [KeyboardButton(text="🔙 Назад")]
+            [KeyboardButton(text="🔙 Назад"), KeyboardButton(text="🏠 Главное меню")]
         ],
         resize_keyboard=True
     )
@@ -119,23 +119,20 @@ def get_icon(action):
 async def send_live():
     tasks = await get_tasks()
 
+    text = "📊 Таблица:\n\n"
+
     if not tasks:
-        text = "😶 Нет задач"
+        text += "😶 Нет задач"
     else:
-        text = "📊 Таблица:\n\n"
         for t in tasks:
             days = format_days(seconds_left(t["end_time"]))
             icon = get_icon(t["action_type"])
             text += f"{t['nickname']} | {icon} | {days} дн.\n"
 
     try:
-        await bot.send_message(
-            GROUP_CHAT_ID,
-            text,
-            message_thread_id=THREAD_ID
-        )
+        await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=THREAD_ID)
     except Exception as e:
-        print("Ошибка отправки:", e)
+        print("LIVE ERROR:", e)
 
 
 async def auto_live():
@@ -144,7 +141,7 @@ async def auto_live():
         await send_live()
 
 
-# ================= DB =================
+# ================= DB FUNCS =================
 
 async def get_user(tg_id):
     async with pool.acquire() as conn:
@@ -196,42 +193,17 @@ async def delete_user(tg_id):
         await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
 
 
-# ================= RATING =================
+# ================= GLOBAL BACK =================
 
-@dp.message(F.text == "🏆 Рейтинг")
-async def rating(message: Message):
-    tasks = await get_tasks()
-
-    build = []
-    research = []
-
-    for t in tasks:
-        days = format_days(seconds_left(t["end_time"]))
-
-        if t["action_type"] == "Строим":
-            build.append((t["nickname"], days))
-        else:
-            research.append((t["nickname"], days))
-
-    build.sort(key=lambda x: x[1], reverse=True)
-    research.sort(key=lambda x: x[1], reverse=True)
-
-    text = "🏆 Рейтинг:\n\n"
-
-    text += "🏗 Строительство:\n"
-    for i, (nick, d) in enumerate(build, 1):
-        text += f"{i}) {nick} — {d} дн.\n"
-
-    text += "\n🔬 Исследования:\n"
-    for i, (nick, d) in enumerate(research, 1):
-        text += f"{i}) {nick} — {d} дн.\n"
-
-    await message.answer(text)
+@dp.message(F.text == "🏠 Главное меню")
+async def go_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Меню", reply_markup=main_menu())
 
 
-# ================= HANDLERS =================
+# ================= START =================
 
-@dp.message(F.text.in_({"/start", "/menu", "🏠 Главное меню"}))
+@dp.message(F.text.in_({"/start", "/menu"}))
 async def menu(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
 
@@ -250,11 +222,48 @@ async def reg(message: Message, state: FSMContext):
     await state.clear()
 
 
+# ================= CREATE =================
+
+@dp.message(F.text == "🛠 Создать запись")
+async def create(message: Message, state: FSMContext):
+    await message.answer("Выбери действие", reply_markup=action_menu())
+    await state.set_state(Form.action)
+
+
+@dp.message(Form.action)
+async def action(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await go_menu(message, state)
+        return
+
+    await state.update_data(action=message.text)
+    await message.answer("Сколько дней?", reply_markup=back_menu())
+    await state.set_state(Form.days)
+
+
+@dp.message(Form.days)
+async def days(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await create(message, state)
+        return
+
+    if not message.text.isdigit():
+        await message.answer("Введи число")
+        return
+
+    data = await state.get_data()
+
+    await add_task(message.from_user.id, data["action"], int(message.text))
+
+    await message.answer("✅ Запись создана", reply_markup=main_menu())
+    await send_live()
+    await state.clear()
+
+
 # ================= RUN =================
 
 async def main():
     await init_db()
-
     asyncio.create_task(auto_live())
 
     await bot.delete_webhook(drop_pending_updates=True)

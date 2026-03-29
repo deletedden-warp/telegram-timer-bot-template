@@ -377,7 +377,8 @@ async def boost_target(message: Message, state: FSMContext):
 @dp.message(Form.boost_percent)
 async def boost_apply(message: Message, state: FSMContext):
     if message.text == "🔙 Назад":
-        await state.set_state(Form.boost_target)
+        await state.clear()
+        await message.answer("Меню", reply_markup=main_menu())
         return
 
     percent_map = {"Уровень 1: 5%":0.05,"Уровень 2: 10%":0.10,"Уровень 3: 15%":0.15}

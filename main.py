@@ -7,7 +7,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -20,7 +20,6 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN").strip().replace('"', '')
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# 🔥 ВАЖНО — твой чат
 GROUP_CHAT_ID = -1003672834247
 
 bot = Bot(token=BOT_TOKEN)
@@ -69,8 +68,6 @@ def main_menu():
         keyboard=[
             [KeyboardButton(text="🛠 Создать запись")],
             [KeyboardButton(text="📜 Посмотреть все записи")],
-            [KeyboardButton(text="⚡ Буст игрока")],
-            [KeyboardButton(text="🏆 Рейтинг")],
             [KeyboardButton(text="🗑 Удалить свои записи")],
             [KeyboardButton(text="💀 Удалиться из базы")]
         ],
@@ -88,24 +85,6 @@ def action_menu():
     )
 
 
-def back_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🔙 Назад"), KeyboardButton(text="🏠 Главное меню")]
-        ],
-        resize_keyboard=True
-    )
-
-
-def inline_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛠 Создать", callback_data="create")],
-        [InlineKeyboardButton(text="📜 Список", callback_data="list")],
-        [InlineKeyboardButton(text="⚡ Буст", callback_data="boost")],
-        [InlineKeyboardButton(text="🏆 Рейтинг", callback_data="rating")]
-    ])
-
-
 # ================= UTILS =================
 
 def seconds_left(end_time):
@@ -116,43 +95,25 @@ def format_days(seconds):
     return max(0, seconds // 86400)
 
 
-def get_icon(action):
-    return "🏗" if action == "Строим" else "🔬"
-
-
-# ================= LIVE =================
-
-async def build_table():
+async def send_live():
     tasks = await get_tasks()
 
     if not tasks:
-        return "😶 Нет задач"
-
-    text = "📊 Задачи:\n\n"
-    for t in tasks:
-        left = format_days(seconds_left(t["end_time"]))
-        icon = get_icon(t["action_type"])
-        text += f"{t['nickname']} | {icon} | {left} дн.\n"
-
-    return text
-
-
-async def send_live():
-    text = await build_table()
+        text = "😶 Нет задач"
+    else:
+        text = "📊 Задачи:\n\n"
+        for t in tasks:
+            days = format_days(seconds_left(t["end_time"]))
+            icon = "🏗" if t["action_type"] == "Строим" else "🔬"
+            text += f"{t['nickname']} | {icon} | {days} дн.\n"
 
     try:
         await bot.send_message(GROUP_CHAT_ID, text)
     except Exception as e:
-        print("Ошибка отправки в группу:", e)
+        print("Ошибка отправки:", e)
 
 
-async def auto_live():
-    while True:
-        await asyncio.sleep(14400)
-        await send_live()
-
-
-# ================= DB =================
+# ================= DB FUNCS =================
 
 async def get_user(tg_id):
     async with pool.acquire() as conn:
@@ -170,17 +131,6 @@ async def create_user(tg_id, nickname, chat_id):
         """, tg_id, nickname, chat_id)
 
 
-async def delete_user(tg_id):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
-        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
-
-
-async def delete_my_tasks(tg_id):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
-
-
 async def add_task(tg_id, action, days):
     end_time = datetime.utcnow() + timedelta(days=days)
 
@@ -194,28 +144,21 @@ async def add_task(tg_id, action, days):
 async def get_tasks():
     async with pool.acquire() as conn:
         return await conn.fetch("""
-        SELECT t.id, u.nickname, t.action_type, t.end_time, t.user_id
+        SELECT t.id, u.nickname, t.action_type, t.end_time
         FROM tasks t
         JOIN users u ON u.tg_id = t.user_id
         """)
 
 
-async def update_task(task_id, new_time):
+async def delete_my_tasks(tg_id):
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE tasks SET end_time=$1 WHERE id=$2", new_time, task_id)
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
 
 
-async def delete_finished():
+async def delete_user(tg_id):
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM tasks WHERE end_time <= NOW()")
-
-
-# ================= TIMER =================
-
-async def timer_loop():
-    while True:
-        await delete_finished()
-        await asyncio.sleep(60)
+        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
 
 
 # ================= HANDLERS =================
@@ -229,10 +172,7 @@ async def menu(message: Message, state: FSMContext):
         await state.set_state(Form.nickname)
         return
 
-    if message.chat.type == "private":
-        await message.answer("Меню", reply_markup=main_menu())
-    else:
-        await message.answer("Меню", reply_markup=inline_menu())
+    await message.answer("Меню", reply_markup=main_menu())
 
 
 @dp.message(Form.nickname)
@@ -242,8 +182,6 @@ async def reg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= CREATE =================
-
 @dp.message(F.text == "🛠 Создать запись")
 async def create(message: Message, state: FSMContext):
     await message.answer("Выбери действие", reply_markup=action_menu())
@@ -252,22 +190,17 @@ async def create(message: Message, state: FSMContext):
 
 @dp.message(Form.action)
 async def action(message: Message, state: FSMContext):
-    if message.text == "🔙 Назад":
+    if message.text in ["🔙 Назад", "🏠 Главное меню"]:
         await menu(message, state)
         return
 
     await state.update_data(action=message.text)
-    await message.answer("Сколько дней?", reply_markup=back_menu())
+    await message.answer("Сколько дней?")
     await state.set_state(Form.days)
 
 
 @dp.message(Form.days)
 async def days(message: Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await message.answer("Выбери действие", reply_markup=action_menu())
-        await state.set_state(Form.action)
-        return
-
     if not message.text.isdigit():
         return
 
@@ -279,20 +212,36 @@ async def days(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= DELETE =================
+@dp.message(F.text == "📜 Посмотреть все записи")
+async def list_tasks(message: Message):
+    tasks = await get_tasks()
+
+    text = ""
+    for t in tasks:
+        days = format_days(seconds_left(t["end_time"]))
+        text += f"{t['nickname']} | {t['action_type']} | {days} дн.\n"
+
+    await message.answer(text or "Пусто")
+
 
 @dp.message(F.text == "🗑 Удалить свои записи")
 async def delete_tasks(message: Message):
     await delete_my_tasks(message.from_user.id)
-    await message.answer("Все твои записи удалены")
+    await message.answer("Удалено")
     await send_live()
 
 
 @dp.message(F.text == "💀 Удалиться из базы")
 async def del_user(message: Message):
     await delete_user(message.from_user.id)
-    await message.answer("Удалён из базы")
+    await message.answer("Удалён")
     await send_live()
+
+
+# 🔥 ловим всё остальное
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Используй кнопки меню 👇")
 
 
 # ================= RUN =================
@@ -300,8 +249,8 @@ async def del_user(message: Message):
 async def main():
     await init_db()
 
-    asyncio.create_task(timer_loop())
-    asyncio.create_task(auto_live())
+    # 🔥 анти-конфликт
+    await bot.delete_webhook(drop_pending_updates=True)
 
     await dp.start_polling(bot)
 

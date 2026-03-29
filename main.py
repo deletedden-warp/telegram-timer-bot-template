@@ -4,10 +4,7 @@ import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup, KeyboardButton,
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -26,6 +23,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 pool: asyncpg.Pool = None
+last_message_id = None
 
 
 # ================= FSM =================
@@ -34,12 +32,14 @@ class Form(StatesGroup):
     nickname = State()
     action = State()
     days = State()
+    delete_one = State()
+    confirm_delete = State()
     boost_type = State()
     boost_target = State()
     boost_percent = State()
 
 
-# ================= KEYBOARDS =================
+# ================= UI =================
 
 def main_menu():
     return ReplyKeyboardMarkup(
@@ -48,7 +48,8 @@ def main_menu():
             [KeyboardButton(text="📜 Посмотреть все записи")],
             [KeyboardButton(text="🏆 Рейтинг")],
             [KeyboardButton(text="⚡ Буст")],
-            [KeyboardButton(text="🗑 Удалить свои записи")],
+            [KeyboardButton(text="🗑 Удалить одну запись")],
+            [KeyboardButton(text="🧹 Удалить все записи")],
             [KeyboardButton(text="💀 Удалиться из базы")]
         ],
         resize_keyboard=True
@@ -67,12 +68,12 @@ def action_menu():
 
 # ================= UTILS =================
 
-def seconds_left(end_time):
-    return max(0, int((end_time - datetime.utcnow()).total_seconds()))
+def seconds_left(end):
+    return max(0, int((end - datetime.utcnow()).total_seconds()))
 
 
-def format_days(seconds):
-    return max(0, seconds // 86400)
+def days_left(end):
+    return seconds_left(end) // 86400
 
 
 def icon(t):
@@ -106,6 +107,11 @@ async def init_db():
 
 # ================= DB FUNCS =================
 
+async def get_user(tg_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
+
+
 async def create_user(tg_id, nickname, chat_id):
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -114,20 +120,6 @@ async def create_user(tg_id, nickname, chat_id):
         ON CONFLICT (tg_id) DO UPDATE
         SET nickname=$2, chat_id=$3
         """, tg_id, nickname, chat_id)
-
-
-async def get_user(tg_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
-
-
-async def add_task(tg_id, action, days):
-    end = datetime.utcnow() + timedelta(days=days)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO tasks (user_id, action_type, end_time) VALUES ($1,$2,$3)",
-            tg_id, action, end
-        )
 
 
 async def get_tasks():
@@ -139,12 +131,37 @@ async def get_tasks():
         """)
 
 
-async def update_task_time(task_id, new_time):
+async def get_user_tasks(tg_id):
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+        SELECT * FROM tasks WHERE user_id=$1
+        """, tg_id)
+
+
+async def add_task(tg_id, action, days):
+    tasks = await get_user_tasks(tg_id)
+
+    # лимит: 1 тип
+    for t in tasks:
+        if t["action_type"] == action:
+            return False
+
+    if len(tasks) >= 2:
+        return False
+
+    end = datetime.utcnow() + timedelta(days=days)
+
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE tasks SET end_time=$1 WHERE id=$2",
-            new_time, task_id
+            "INSERT INTO tasks (user_id, action_type, end_time) VALUES ($1,$2,$3)",
+            tg_id, action, end
         )
+    return True
+
+
+async def delete_task(task_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE id=$1", task_id)
 
 
 async def delete_tasks_user(tg_id):
@@ -155,39 +172,62 @@ async def delete_tasks_user(tg_id):
 async def delete_user(tg_id):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
-        result = await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
-        return result
+        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
 
 
-# ================= TIMER =================
+async def update_task(task_id, new_time):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tasks SET end_time=$1 WHERE id=$2",
+            new_time, task_id
+        )
 
-async def timer_loop():
-    while True:
-        async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM tasks WHERE end_time <= NOW()")
-        await asyncio.sleep(60)
 
+# ================= RATING =================
 
-# ================= LIFE TABLE =================
+async def send_rating():
+    global last_message_id
 
-async def send_life_table():
     tasks = await get_tasks()
 
-    if not tasks:
-        text = "😶 Нет активных задач"
-    else:
-        text = "📊 Таблица:\n\n"
-        for t in tasks:
-            left = format_days(seconds_left(t["end_time"]))
-            text += f"{t['nickname']} | {icon(t['action_type'])} | {left} дней\n"
+    build = []
+    research = []
 
-    await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=THREAD_ID)
+    for t in tasks:
+        d = days_left(t["end_time"])
+        if "Строим" in t["action_type"]:
+            build.append((t["nickname"], d))
+        else:
+            research.append((t["nickname"], d))
+
+    build.sort(key=lambda x: x[1], reverse=True)
+    research.sort(key=lambda x: x[1], reverse=True)
+
+    text = "🏆 Рейтинг\n\n"
+
+    text += "🏗 Стройка:\n"
+    for i, t in enumerate(build, 1):
+        text += f"{i}) {t[0]} — {t[1]} дн\n"
+
+    text += "\n🔬 Исследования:\n"
+    for i, t in enumerate(research, 1):
+        text += f"{i}) {t[0]} — {t[1]} дн\n"
+
+    # удаляем старое сообщение
+    try:
+        if last_message_id:
+            await bot.delete_message(GROUP_CHAT_ID, last_message_id)
+    except:
+        pass
+
+    msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=THREAD_ID)
+    last_message_id = msg.message_id
 
 
-async def auto_report():
+async def auto_rating():
     while True:
         await asyncio.sleep(14400)
-        await send_life_table()
+        await send_rating()
 
 
 # ================= HANDLERS =================
@@ -211,22 +251,168 @@ async def reg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= DELETE USER FIX =================
+# ================= CREATE =================
 
-@dp.message(F.text == "💀 Удалиться из базы")
-async def delete_me(message: Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
+@dp.message(F.text == "🛠 Создать запись")
+async def create(message: Message, state: FSMContext):
+    await message.answer("Выбери действие", reply_markup=action_menu())
+    await state.set_state(Form.action)
 
-    if not user:
-        await message.answer("⚠️ Ты уже удалён")
+
+@dp.message(Form.action)
+async def action(message: Message, state: FSMContext):
+    if message.text == "⬅️ Назад":
+        await message.answer("Меню", reply_markup=main_menu())
+        await state.clear()
         return
 
-    await delete_user(message.from_user.id)
+    await state.update_data(action=message.text)
+    await message.answer("Сколько дней?")
+    await state.set_state(Form.days)
 
-    await message.answer("💀 Ты полностью удалён из базы")
 
-    await send_life_table()
+@dp.message(Form.days)
+async def days(message: Message, state: FSMContext):
+    data = await state.get_data()
 
+    ok = await add_task(message.from_user.id, data["action"], int(message.text))
+
+    if not ok:
+        await message.answer("❌ Лимит или уже есть такая запись", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    await message.answer("✅ Создано", reply_markup=main_menu())
+    await send_rating()
+    await state.clear()
+
+
+# ================= DELETE ONE =================
+
+@dp.message(F.text == "🗑 Удалить одну запись")
+async def delete_one(message: Message, state: FSMContext):
+    tasks = await get_tasks()
+
+    kb = [[KeyboardButton(text=f"{t['id']} | {t['nickname']} | {icon(t['action_type'])}")]
+          for t in tasks if t["user_id"] == message.from_user.id]
+
+    await message.answer("Выбери запись", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    await state.set_state(Form.delete_one)
+
+
+@dp.message(Form.delete_one)
+async def delete_one_apply(message: Message, state: FSMContext):
+    task_id = int(message.text.split(" | ")[0])
+    await delete_task(task_id)
+
+    await message.answer("Удалено", reply_markup=main_menu())
+    await send_rating()
+    await state.clear()
+
+
+# ================= DELETE ALL =================
+
+@dp.message(F.text == "🧹 Удалить все записи")
+async def delete_all(message: Message):
+    await delete_tasks_user(message.from_user.id)
+    await message.answer("Удалено всё", reply_markup=main_menu())
+    await send_rating()
+
+
+# ================= DELETE USER =================
+
+@dp.message(F.text == "💀 Удалиться из базы")
+async def delete_confirm(message: Message, state: FSMContext):
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Да"), KeyboardButton(text="❌ Нет")]
+        ],
+        resize_keyboard=True
+    )
+    await message.answer("Ты уверен?", reply_markup=kb)
+    await state.set_state(Form.confirm_delete)
+
+
+@dp.message(Form.confirm_delete)
+async def delete_final(message: Message, state: FSMContext):
+    if "Да" in message.text:
+        await delete_user(message.from_user.id)
+        await message.answer("Удалён", reply_markup=main_menu())
+        await send_rating()
+    else:
+        await message.answer("Отмена", reply_markup=main_menu())
+
+    await state.clear()
+
+
+# ================= BOOST =================
+
+@dp.message(F.text == "⚡ Буст")
+async def boost_start(message: Message, state: FSMContext):
+    await message.answer("Тип?", reply_markup=action_menu())
+    await state.set_state(Form.boost_type)
+
+
+@dp.message(Form.boost_type)
+async def boost_type(message: Message, state: FSMContext):
+    await state.update_data(type=message.text)
+
+    tasks = await get_tasks()
+
+    kb = [[KeyboardButton(text=f"{t['nickname']} | {icon(t['action_type'])} | {days_left(t['end_time'])} д")]
+          for t in tasks]
+
+    await message.answer("Кого бустим?", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    await state.set_state(Form.boost_target)
+
+
+@dp.message(Form.boost_target)
+async def boost_target(message: Message, state: FSMContext):
+    nickname = message.text.split(" | ")[0]
+
+    user = await get_user(message.from_user.id)
+    if user["nickname"] == nickname:
+        await message.answer("❌ Нельзя бустить себя", reply_markup=main_menu())
+        await state.clear()
+        return
+
+    await state.update_data(target=nickname)
+
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="5%")],
+            [KeyboardButton(text="10%")],
+            [KeyboardButton(text="15%")]
+        ],
+        resize_keyboard=True
+    )
+
+    await message.answer("Процент?", reply_markup=kb)
+    await state.set_state(Form.boost_percent)
+
+
+@dp.message(Form.boost_percent)
+async def boost_apply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    percent = int(message.text.replace("%", "")) / 100
+
+    tasks = await get_tasks()
+    attacker = (await get_user(message.from_user.id))["nickname"]
+
+    for t in tasks:
+        if t["nickname"] == data["target"]:
+            left = seconds_left(t["end_time"])
+            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
+            await update_task(t["id"], new_time)
+
+            await bot.send_message(
+                GROUP_CHAT_ID,
+                f"🎉 {attacker} бустанул {t['nickname']} на {int(percent*100)}%",
+                message_thread_id=THREAD_ID
+            )
+
+    await send_rating()
+    await message.answer("Готово", reply_markup=main_menu())
     await state.clear()
 
 
@@ -235,8 +421,7 @@ async def delete_me(message: Message, state: FSMContext):
 async def main():
     await init_db()
 
-    asyncio.create_task(timer_loop())
-    asyncio.create_task(auto_report())
+    asyncio.create_task(auto_rating())
 
     await dp.start_polling(bot)
 

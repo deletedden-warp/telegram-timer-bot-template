@@ -17,8 +17,16 @@ import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "ТВОЙ_ТОКЕН"
-DATABASE_URL = "ТВОЙ_DATABASE_URL"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в переменных окружения")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не найден")
+
+bot = Bot(token=BOT_TOKEN.strip())
 
 GROUP_CHAT_ID = -1003672834247
 TOPIC_ID = 5239

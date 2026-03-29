@@ -13,8 +13,8 @@ import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "YOUR_BOT_TOKEN_HERE"
+DATABASE_URL = os.getenv("DATABASE_URL") or "postgresql://user:password@localhost:5432/db"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -53,7 +53,6 @@ class Form(StatesGroup):
     nickname = State()
     action = State()
     days = State()
-    edit_nick = State()
 
 
 # ================= SCHEDULER =================
@@ -82,8 +81,8 @@ async def daily_sender():
                 for u in users:
                     try:
                         await bot.send_message(u["chat_id"], text)
-                    except:
-                        pass
+                    except Exception as e:
+                        logging.error(e)
 
             await asyncio.sleep(60)
 
@@ -94,9 +93,7 @@ async def daily_sender():
 
 async def get_user(tg_id):
     async with pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT * FROM users WHERE tg_id=$1", tg_id
-        )
+        return await conn.fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
 
 
 async def create_user(tg_id, nickname, chat_id):
@@ -117,9 +114,7 @@ async def update_chat(tg_id, chat_id):
 
 async def count_tasks(tg_id):
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT COUNT(*) FROM tasks WHERE user_id=$1", tg_id
-        )
+        return await conn.fetchval("SELECT COUNT(*) FROM tasks WHERE user_id=$1", tg_id)
 
 
 async def add_task(tg_id, action, days):
@@ -132,9 +127,7 @@ async def add_task(tg_id, action, days):
 
 async def delete_tasks(tg_id):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM tasks WHERE user_id=$1", tg_id
-        )
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
 
 
 async def get_all_tasks():
@@ -153,7 +146,7 @@ def main_menu():
         keyboard=[
             [KeyboardButton(text="🛠 Создать запись")],
             [KeyboardButton(text="🗑 Удалить мои записи")],
-            [KeyboardButton(text="📜 Посмотреть все записи")],
+            [KeyboardButton(text="📜 Посмотреть все записи")]
         ],
         resize_keyboard=True
     )
@@ -168,9 +161,9 @@ def action_menu():
     )
 
 
-# ================= START =================
+# ================= START / MENU =================
 
-@dp.message(F.text == "/menu")
+@dp.message(F.text.in_({"/start", "/menu"}))
 async def menu(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
 
@@ -214,7 +207,7 @@ async def action(message: Message, state: FSMContext):
         return
 
     await state.update_data(action=message.text)
-    await message.answer("⏳ Сколько осталось дней до завершения? (просто введи число)")
+    await message.answer("⏳ Сколько осталось дней до завершения?")
     await state.set_state(Form.days)
 
 
@@ -272,6 +265,7 @@ async def all_tasks(message: Message):
 async def main():
     await init_db()
     asyncio.create_task(daily_sender())
+    logging.info("Bot started...")
     await dp.start_polling(bot)
 
 

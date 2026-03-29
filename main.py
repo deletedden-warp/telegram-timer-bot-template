@@ -65,13 +65,6 @@ def action_menu():
     )
 
 
-def back_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="⬅️ Назад")]],
-        resize_keyboard=True
-    )
-
-
 # ================= UTILS =================
 
 def seconds_left(end_time):
@@ -247,7 +240,24 @@ async def days(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= LIST (ONLY DM) =================
+# ================= DELETE TASKS =================
+
+@dp.message(F.text == "🗑 Удалить свои записи")
+async def delete_my_tasks(message: Message):
+    await delete_tasks_user(message.from_user.id)
+    await message.answer("🗑 Все твои записи удалены", reply_markup=main_menu())
+    await send_life_table()
+
+
+# ================= DELETE USER =================
+
+@dp.message(F.text == "💀 Удалиться из базы")
+async def delete_me(message: Message):
+    await delete_user(message.from_user.id)
+    await message.answer("💀 Ты удалён из базы")
+    
+
+# ================= LIST =================
 
 @dp.message(F.text == "📜 Посмотреть все записи")
 async def list_tasks(message: Message):
@@ -360,7 +370,6 @@ async def boost_apply(message: Message, state: FSMContext):
             await update_task_time(t["id"], new_time)
 
             days = format_days(seconds_left(new_time))
-
             action_text = "строить" if "Строим" in t["action_type"] else "исследовать"
 
             await bot.send_message(

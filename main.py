@@ -17,7 +17,7 @@ import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 
-# ================= TOKEN FIX =================
+# ================= TOKEN =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -67,9 +67,6 @@ class Form(StatesGroup):
     nickname = State()
     action = State()
     days = State()
-    attack_type = State()
-    attack_target = State()
-    attack_percent = State()
 
 
 # ================= KEYBOARDS =================
@@ -79,7 +76,6 @@ def main_menu():
         keyboard=[
             [KeyboardButton(text="🛠 Создать запись")],
             [KeyboardButton(text="📜 Все записи")],
-            [KeyboardButton(text="⚔️ Сократить время игроку")]
         ],
         resize_keyboard=True
     )
@@ -92,14 +88,6 @@ def action_menu():
         ],
         resize_keyboard=True
     )
-
-
-def inline_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛠 Создать", callback_data="create")],
-        [InlineKeyboardButton(text="📜 Список", callback_data="list")],
-        [InlineKeyboardButton(text="⚔️ Атака", callback_data="attack")]
-    ])
 
 
 # ================= UTILS =================
@@ -122,18 +110,13 @@ async def get_user(tg_id):
 
 async def create_user(tg_id, nickname, chat_id):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (tg_id, nickname, chat_id) VALUES ($1,$2,$3)",
-            tg_id, nickname, chat_id
-        )
-
-
-async def update_chat(tg_id, chat_id):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET chat_id=$1 WHERE tg_id=$2",
-            chat_id, tg_id
-        )
+        await conn.execute("""
+            INSERT INTO users (tg_id, nickname, chat_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (tg_id) DO UPDATE
+            SET nickname = EXCLUDED.nickname,
+                chat_id = EXCLUDED.chat_id
+        """, tg_id, nickname, chat_id)
 
 
 async def add_task(tg_id, action, days):
@@ -149,53 +132,10 @@ async def add_task(tg_id, action, days):
 async def get_tasks():
     async with pool.acquire() as conn:
         return await conn.fetch("""
-        SELECT t.id, u.nickname, t.action_type, t.end_time, t.user_id
+        SELECT t.id, u.nickname, t.action_type, t.end_time
         FROM tasks t
         JOIN users u ON u.tg_id = t.user_id
         """)
-
-
-async def update_task_time(task_id, new_time):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE tasks SET end_time=$1 WHERE id=$2",
-            new_time, task_id
-        )
-
-
-# ================= TIMER =================
-
-async def timer_loop():
-    while True:
-        async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM tasks WHERE end_time <= NOW()")
-        await asyncio.sleep(60)
-
-
-# ================= AUTO REPORT =================
-
-async def auto_report():
-    while True:
-        await asyncio.sleep(7200)
-
-        tasks = await get_tasks()
-
-        if not tasks:
-            text = "😶 Нет активных задач"
-        else:
-            text = "📊 Таблица:\n\n"
-            for i, t in enumerate(tasks, 1):
-                left = seconds_left(t["end_time"])
-                text += f"{i}) {t['nickname']} | {t['action_type']} | {format_days(left)}\n"
-
-        async with pool.acquire() as conn:
-            users = await conn.fetch("SELECT DISTINCT chat_id FROM users")
-
-        for u in users:
-            try:
-                await bot.send_message(u["chat_id"], text)
-            except:
-                pass
 
 
 # ================= HANDLERS =================
@@ -205,29 +145,85 @@ async def menu(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
 
     if not user:
-        await message.answer("Введи ник")
+        await message.answer("Введи ник:")
         await state.set_state(Form.nickname)
         return
 
-    if message.chat.type == "private":
-        await message.answer("Меню", reply_markup=main_menu())
-    else:
-        await message.answer("Меню", reply_markup=inline_menu())
+    await message.answer("Меню", reply_markup=main_menu())
 
 
 @dp.message(Form.nickname)
 async def reg(message: Message, state: FSMContext):
     await create_user(message.from_user.id, message.text, message.chat.id)
-    await message.answer("Готово", reply_markup=main_menu())
+
+    await message.answer("✅ Ты зарегистрирован", reply_markup=main_menu())
     await state.clear()
+
+
+# ================= CREATE =================
+
+@dp.message(F.text == "🛠 Создать запись")
+async def create(message: Message, state: FSMContext):
+    await message.answer("Выбери действие", reply_markup=action_menu())
+    await state.set_state(Form.action)
+
+
+@dp.message(Form.action)
+async def action(message: Message, state: FSMContext):
+    if message.text not in ["🏗 Строим", "🔬 Исследуем", "Строим", "Исследуем"]:
+        await message.answer("Выбери кнопку")
+        return
+
+    action = "Строим" if "Строим" in message.text else "Исследуем"
+
+    await state.update_data(action=action)
+    await message.answer("Сколько дней?")
+    await state.set_state(Form.days)
+
+
+@dp.message(Form.days)
+async def days(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Введи число")
+        return
+
+    data = await state.get_data()
+
+    await add_task(message.from_user.id, data["action"], int(message.text))
+
+    await message.answer("✅ Запись создана")
+    await state.clear()
+
+
+# ================= LIST =================
+
+@dp.message(F.text == "📜 Все записи")
+async def list_tasks(message: Message):
+    tasks = await get_tasks()
+
+    if not tasks:
+        await message.answer("😶 Нет записей")
+        return
+
+    text = "📋 Список:\n\n"
+    for t in tasks:
+        left = seconds_left(t["end_time"])
+        text += f"{t['nickname']} | {t['action_type']} | {format_days(left)}\n"
+
+    await message.answer(text)
+
+
+# ================= FALLBACK =================
+
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Не понял команду. Напиши /menu")
 
 
 # ================= RUN =================
 
 async def main():
     await init_db()
-    asyncio.create_task(timer_loop())
-    asyncio.create_task(auto_report())
     await dp.start_polling(bot)
 
 

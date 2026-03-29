@@ -20,6 +20,9 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN").strip().replace('"', '')
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# 🔥 ВАЖНО — твой чат
+GROUP_CHAT_ID = -1003672834247
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -68,6 +71,7 @@ def main_menu():
             [KeyboardButton(text="📜 Посмотреть все записи")],
             [KeyboardButton(text="⚡ Буст игрока")],
             [KeyboardButton(text="🏆 Рейтинг")],
+            [KeyboardButton(text="🗑 Удалить свои записи")],
             [KeyboardButton(text="💀 Удалиться из базы")]
         ],
         resize_keyboard=True
@@ -108,8 +112,12 @@ def seconds_left(end_time):
     return int((end_time - datetime.utcnow()).total_seconds())
 
 
-def format_time(seconds):
-    return f"{max(0, seconds // 86400)} дн."
+def format_days(seconds):
+    return max(0, seconds // 86400)
+
+
+def get_icon(action):
+    return "🏗" if action == "Строим" else "🔬"
 
 
 # ================= LIVE =================
@@ -122,8 +130,9 @@ async def build_table():
 
     text = "📊 Задачи:\n\n"
     for t in tasks:
-        left = seconds_left(t["end_time"])
-        text += f"{t['nickname']} | {t['action_type']} | {format_time(left)}\n"
+        left = format_days(seconds_left(t["end_time"]))
+        icon = get_icon(t["action_type"])
+        text += f"{t['nickname']} | {icon} | {left} дн.\n"
 
     return text
 
@@ -131,14 +140,10 @@ async def build_table():
 async def send_live():
     text = await build_table()
 
-    async with pool.acquire() as conn:
-        users = await conn.fetch("SELECT DISTINCT chat_id FROM users WHERE chat_id IS NOT NULL")
-
-    for u in users:
-        try:
-            await bot.send_message(u["chat_id"], text)
-        except:
-            pass
+    try:
+        await bot.send_message(GROUP_CHAT_ID, text)
+    except Exception as e:
+        print("Ошибка отправки в группу:", e)
 
 
 async def auto_live():
@@ -171,6 +176,11 @@ async def delete_user(tg_id):
         await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
 
 
+async def delete_my_tasks(tg_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
+
+
 async def add_task(tg_id, action, days):
     end_time = datetime.utcnow() + timedelta(days=days)
 
@@ -184,7 +194,7 @@ async def add_task(tg_id, action, days):
 async def get_tasks():
     async with pool.acquire() as conn:
         return await conn.fetch("""
-        SELECT t.id, u.nickname, t.action_type, t.end_time
+        SELECT t.id, u.nickname, t.action_type, t.end_time, t.user_id
         FROM tasks t
         JOIN users u ON u.tg_id = t.user_id
         """)
@@ -269,64 +279,19 @@ async def days(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= DELETE USER =================
+# ================= DELETE =================
+
+@dp.message(F.text == "🗑 Удалить свои записи")
+async def delete_tasks(message: Message):
+    await delete_my_tasks(message.from_user.id)
+    await message.answer("Все твои записи удалены")
+    await send_live()
+
 
 @dp.message(F.text == "💀 Удалиться из базы")
 async def del_user(message: Message):
     await delete_user(message.from_user.id)
     await message.answer("Удалён из базы")
-
-
-# ================= LIST =================
-
-@dp.message(F.text == "📜 Посмотреть все записи")
-async def list_tasks(message: Message):
-    await message.answer(await build_table())
-
-
-# ================= BOOST =================
-
-@dp.message(F.text == "⚡ Буст игрока")
-async def boost(message: Message):
-    tasks = await get_tasks()
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=t["nickname"], callback_data=f"bst_{t['id']}")]
-            for t in tasks
-        ]
-    )
-
-    await message.answer("Выбери цель", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("bst_"))
-async def choose_percent(call: CallbackQuery):
-    task_id = int(call.data.split("_")[1])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="5%", callback_data=f"p5_{task_id}")],
-        [InlineKeyboardButton(text="10%", callback_data=f"p10_{task_id}")],
-        [InlineKeyboardButton(text="15%", callback_data=f"p15_{task_id}")]
-    ])
-
-    await call.message.answer("Выбери процент", reply_markup=kb)
-
-
-@dp.callback_query(F.data.startswith("p"))
-async def apply_boost(call: CallbackQuery):
-    percent = int(call.data.split("_")[0][1:]) / 100
-    task_id = int(call.data.split("_")[1])
-
-    tasks = await get_tasks()
-
-    for t in tasks:
-        if t["id"] == task_id:
-            left = seconds_left(t["end_time"])
-            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
-            await update_task(task_id, new_time)
-
-    await call.message.answer("⚡ Буст применён")
     await send_live()
 
 

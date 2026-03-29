@@ -67,7 +67,27 @@ def main_menu():
             [KeyboardButton(text="🛠 Создать запись")],
             [KeyboardButton(text="📜 Посмотреть все записи")],
             [KeyboardButton(text="⚡ Буст игрока")],
-            [KeyboardButton(text="🏆 Рейтинг")]
+            [KeyboardButton(text="🏆 Рейтинг")],
+            [KeyboardButton(text="💀 Удалиться из базы")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def action_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🏗 Строим"), KeyboardButton(text="🔬 Исследуем")],
+            [KeyboardButton(text="🔙 Назад"), KeyboardButton(text="🏠 Главное меню")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def back_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔙 Назад"), KeyboardButton(text="🏠 Главное меню")]
         ],
         resize_keyboard=True
     )
@@ -92,7 +112,7 @@ def format_time(seconds):
     return f"{max(0, seconds // 86400)} дн."
 
 
-# ================= LIVE TABLE =================
+# ================= LIVE =================
 
 async def build_table():
     tasks = await get_tasks()
@@ -145,6 +165,12 @@ async def create_user(tg_id, nickname, chat_id):
         """, tg_id, nickname, chat_id)
 
 
+async def delete_user(tg_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
+
+
 async def add_task(tg_id, action, days):
     end_time = datetime.utcnow() + timedelta(days=days)
 
@@ -182,49 +208,9 @@ async def timer_loop():
         await asyncio.sleep(60)
 
 
-# ================= RATING =================
+# ================= HANDLERS =================
 
-async def build_rating():
-    tasks = await get_tasks()
-
-    build_map = {}
-    research_map = {}
-
-    for t in tasks:
-        left = seconds_left(t["end_time"])
-        days = left // 86400
-        nick = t["nickname"]
-
-        if t["action_type"] == "Строим":
-            build_map[nick] = build_map.get(nick, 0) + days
-        else:
-            research_map[nick] = research_map.get(nick, 0) + days
-
-    build_sorted = sorted(build_map.items(), key=lambda x: x[1], reverse=True)
-    research_sorted = sorted(research_map.items(), key=lambda x: x[1], reverse=True)
-
-    text = "🏆 Рейтинг игроков\n\n"
-
-    text += "🏗 Стройка:\n"
-    if not build_sorted:
-        text += "— пусто\n"
-    else:
-        for i, (nick, days) in enumerate(build_sorted, 1):
-            text += f"{i}) {nick} — {days} дн.\n"
-
-    text += "\n🔬 Исследования:\n"
-    if not research_sorted:
-        text += "— пусто\n"
-    else:
-        for i, (nick, days) in enumerate(research_sorted, 1):
-            text += f"{i}) {nick} — {days} дн.\n"
-
-    return text
-
-
-# ================= START =================
-
-@dp.message(F.text.in_({"/start", "/menu"}))
+@dp.message(F.text.in_({"/start", "/menu", "🏠 Главное меню"}))
 async def menu(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
 
@@ -249,52 +235,59 @@ async def reg(message: Message, state: FSMContext):
 # ================= CREATE =================
 
 @dp.message(F.text == "🛠 Создать запись")
-@dp.callback_query(F.data == "create")
-async def create_any(event, state: FSMContext):
-    if isinstance(event, CallbackQuery):
-        await event.message.answer("Строим или Исследуем?")
-    else:
-        await event.answer("Строим или Исследуем?")
+async def create(message: Message, state: FSMContext):
+    await message.answer("Выбери действие", reply_markup=action_menu())
     await state.set_state(Form.action)
 
 
 @dp.message(Form.action)
 async def action(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await menu(message, state)
+        return
+
     await state.update_data(action=message.text)
-    await message.answer("Сколько дней?")
+    await message.answer("Сколько дней?", reply_markup=back_menu())
     await state.set_state(Form.days)
 
 
 @dp.message(Form.days)
 async def days(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("Выбери действие", reply_markup=action_menu())
+        await state.set_state(Form.action)
+        return
+
     if not message.text.isdigit():
         return
 
     data = await state.get_data()
     await add_task(message.from_user.id, data["action"], int(message.text))
 
-    await message.answer("Создано")
+    await message.answer("Создано", reply_markup=main_menu())
     await send_live()
     await state.clear()
+
+
+# ================= DELETE USER =================
+
+@dp.message(F.text == "💀 Удалиться из базы")
+async def del_user(message: Message):
+    await delete_user(message.from_user.id)
+    await message.answer("Удалён из базы")
 
 
 # ================= LIST =================
 
 @dp.message(F.text == "📜 Посмотреть все записи")
-@dp.callback_query(F.data == "list")
-async def list_any(event):
-    text = await build_table()
-    if isinstance(event, CallbackQuery):
-        await event.message.answer(text)
-    else:
-        await event.answer(text)
+async def list_tasks(message: Message):
+    await message.answer(await build_table())
 
 
 # ================= BOOST =================
 
 @dp.message(F.text == "⚡ Буст игрока")
-@dp.callback_query(F.data == "boost")
-async def boost_start(event):
+async def boost(message: Message):
     tasks = await get_tasks()
 
     kb = InlineKeyboardMarkup(
@@ -304,10 +297,7 @@ async def boost_start(event):
         ]
     )
 
-    if isinstance(event, CallbackQuery):
-        await event.message.answer("Выбери цель", reply_markup=kb)
-    else:
-        await event.answer("Выбери цель", reply_markup=kb)
+    await message.answer("Выбери цель", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("bst_"))
@@ -315,12 +305,12 @@ async def choose_percent(call: CallbackQuery):
     task_id = int(call.data.split("_")[1])
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Уровень 1: 5%", callback_data=f"p5_{task_id}")],
-        [InlineKeyboardButton(text="Уровень 2: 10%", callback_data=f"p10_{task_id}")],
-        [InlineKeyboardButton(text="Уровень 3: 15%", callback_data=f"p15_{task_id}")]
+        [InlineKeyboardButton(text="5%", callback_data=f"p5_{task_id}")],
+        [InlineKeyboardButton(text="10%", callback_data=f"p10_{task_id}")],
+        [InlineKeyboardButton(text="15%", callback_data=f"p15_{task_id}")]
     ])
 
-    await call.message.answer("Выбери уровень", reply_markup=kb)
+    await call.message.answer("Выбери процент", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("p"))
@@ -338,19 +328,6 @@ async def apply_boost(call: CallbackQuery):
 
     await call.message.answer("⚡ Буст применён")
     await send_live()
-
-
-# ================= RATING =================
-
-@dp.message(F.text == "🏆 Рейтинг")
-@dp.callback_query(F.data == "rating")
-async def rating_any(event):
-    text = await build_rating()
-
-    if isinstance(event, CallbackQuery):
-        await event.message.answer(text)
-    else:
-        await event.answer(text)
 
 
 # ================= RUN =================

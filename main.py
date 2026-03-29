@@ -17,8 +17,18 @@ import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = "YOUR_TOKEN"
-DATABASE_URL = "YOUR_DB_URL"
+# ================= TOKEN FIX =================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+print("TOKEN RAW:", repr(BOT_TOKEN))
+
+if BOT_TOKEN:
+    BOT_TOKEN = BOT_TOKEN.strip().replace('"', '')
+
+if not BOT_TOKEN or ":" not in BOT_TOKEN:
+    raise ValueError(f"❌ TOKEN BROKEN: {repr(BOT_TOKEN)}")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -158,9 +168,7 @@ async def update_task_time(task_id, new_time):
 async def timer_loop():
     while True:
         async with pool.acquire() as conn:
-            await conn.execute("""
-            DELETE FROM tasks WHERE end_time <= NOW()
-            """)
+            await conn.execute("DELETE FROM tasks WHERE end_time <= NOW()")
         await asyncio.sleep(60)
 
 
@@ -214,133 +222,12 @@ async def reg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= CREATE =================
-
-@dp.message(F.text == "🛠 Создать запись")
-async def create(message: Message, state: FSMContext):
-    await message.answer("Выбери действие", reply_markup=action_menu())
-    await state.set_state(Form.action)
-
-
-@dp.callback_query(F.data == "create")
-async def create_inline(call: CallbackQuery, state: FSMContext):
-    await call.message.answer("Напиши: Строим или Исследуем")
-    await state.set_state(Form.action)
-
-
-@dp.message(Form.action)
-async def action(message: Message, state: FSMContext):
-    await state.update_data(action=message.text)
-    await message.answer("Сколько дней?")
-    await state.set_state(Form.days)
-
-
-@dp.message(Form.days)
-async def days(message: Message, state: FSMContext):
-    data = await state.get_data()
-    await add_task(message.from_user.id, data["action"], int(message.text))
-
-    await message.answer("Создано")
-    await state.clear()
-
-
-# ================= LIST =================
-
-@dp.message(F.text == "📜 Все записи")
-async def list_tasks(message: Message):
-    tasks = await get_tasks()
-
-    text = ""
-    for t in tasks:
-        left = seconds_left(t["end_time"])
-        text += f"{t['nickname']} | {t['action_type']} | {format_days(left)}\n"
-
-    await message.answer(text)
-
-
-@dp.callback_query(F.data == "list")
-async def list_inline(call: CallbackQuery):
-    tasks = await get_tasks()
-
-    text = ""
-    for t in tasks:
-        left = seconds_left(t["end_time"])
-        text += f"{t['nickname']} | {t['action_type']} | {format_days(left)}\n"
-
-    await call.message.answer(text)
-
-
-# ================= ATTACK =================
-
-@dp.message(F.text == "⚔️ Сократить время игроку")
-async def attack(message: Message, state: FSMContext):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🏗 Строим"), KeyboardButton(text="🔬 Исследуем")]
-        ],
-        resize_keyboard=True
-    )
-    await message.answer("Выбери тип", reply_markup=kb)
-    await state.set_state(Form.attack_type)
-
-
-@dp.message(Form.attack_type)
-async def attack_type(message: Message, state: FSMContext):
-    await state.update_data(type=message.text)
-
-    tasks = await get_tasks()
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t["nickname"])] for t in tasks],
-        resize_keyboard=True
-    )
-
-    await message.answer("Выбери игрока", reply_markup=kb)
-    await state.set_state(Form.attack_target)
-
-
-@dp.message(Form.attack_target)
-async def attack_target(message: Message, state: FSMContext):
-    await state.update_data(target=message.text)
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Уровень 1: 5%")],
-            [KeyboardButton(text="Уровень 2: 10%")],
-            [KeyboardButton(text="Уровень 3: 15%")]
-        ],
-        resize_keyboard=True
-    )
-
-    await message.answer("Выбери уровень", reply_markup=kb)
-    await state.set_state(Form.attack_percent)
-
-
-@dp.message(Form.attack_percent)
-async def attack_apply(message: Message, state: FSMContext):
-    data = await state.get_data()
-
-    percent = 0.05 if "1" in message.text else 0.1 if "2" in message.text else 0.15
-
-    tasks = await get_tasks()
-
-    for t in tasks:
-        if t["nickname"] == data["target"]:
-            left = seconds_left(t["end_time"])
-            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
-            await update_task_time(t["id"], new_time)
-
-    await message.answer("Атака применена")
-    await state.clear()
-
-
 # ================= RUN =================
 
 async def main():
     await init_db()
-
     asyncio.create_task(timer_loop())
     asyncio.create_task(auto_report())
-
     await dp.start_polling(bot)
 
 

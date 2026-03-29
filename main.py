@@ -7,7 +7,6 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -21,17 +20,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден в переменных окружения")
+    raise ValueError("BOT_TOKEN не найден")
 
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL не найден")
 
-bot = Bot(token=BOT_TOKEN.strip())
-
 GROUP_CHAT_ID = -1003672834247
 TOPIC_ID = 5239
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN.strip())
 dp = Dispatcher(storage=MemoryStorage())
 
 pool: asyncpg.Pool = None
@@ -163,7 +160,6 @@ async def add_task(tg_id, action, days):
     end_time = datetime.utcnow() + timedelta(days=days)
 
     async with pool.acquire() as conn:
-        # ограничение 1 тип = 1 запись
         existing = await conn.fetchrow("""
         SELECT * FROM tasks WHERE user_id=$1 AND action_type=$2
         """, tg_id, action)
@@ -240,6 +236,14 @@ async def rating_loop():
         await asyncio.sleep(14400)
 
 
+# ================= GLOBAL BACK =================
+
+@dp.message(F.text == "🔙 Назад")
+async def back_handler(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Меню", reply_markup=main_menu())
+
+
 # ================= MENU =================
 
 @dp.message(F.text.in_({"/start", "/menu"}))
@@ -283,10 +287,16 @@ async def action(message: Message, state: FSMContext):
 
 @dp.message(Form.days)
 async def days(message: Message, state: FSMContext):
-    data = await state.get_data()
+    if message.text == "🔙 Назад":
+        await state.clear()
+        await message.answer("Меню", reply_markup=main_menu())
+        return
 
     if not message.text.isdigit():
+        await message.answer("Введи число")
         return
+
+    data = await state.get_data()
 
     success = await add_task(message.from_user.id, data["action"], int(message.text))
 
@@ -294,7 +304,6 @@ async def days(message: Message, state: FSMContext):
         await message.answer("Уже есть запись такого типа")
     else:
         await message.answer("Создано")
-
         await send_rating()
 
     await state.clear()
@@ -319,21 +328,6 @@ async def my_tasks(message: Message):
     await message.answer(text)
 
 
-# ================= RATING PRIVATE =================
-
-@dp.message(F.text == "📊 Рейтинг")
-async def rating_private(message: Message):
-    tasks = await get_tasks()
-
-    text = "📊 Рейтинг:\n\n"
-
-    for t in tasks:
-        days = format_days(seconds_left(t["end_time"]))
-        text += f"{t['nickname']} — {days} дней\n"
-
-    await message.answer(text)
-
-
 # ================= DELETE =================
 
 @dp.message(F.text == "❌ Удалиться из базы")
@@ -352,95 +346,25 @@ async def delete_confirm(message: Message, state: FSMContext):
 async def delete_apply(message: Message, state: FSMContext):
     if message.text == "✅ Да":
         await delete_user(message.from_user.id)
-        await message.answer("Удалено")
+        await message.answer("Удалено", reply_markup=main_menu())
     else:
-        await message.answer("Отмена")
+        await message.answer("Отмена", reply_markup=main_menu())
 
     await state.clear()
-    await message.answer("Меню", reply_markup=main_menu())
 
 
-# ================= BOOST =================
+# ================= FALLBACK =================
 
-@dp.message(F.text == "⚡ Буст")
-async def boost(message: Message, state: FSMContext):
-    tasks = await get_tasks()
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=f"{t['nickname']} / {icon(t['action_type'])} / {format_days(seconds_left(t['end_time']))} д")]
-            for t in tasks
-        ] + [[KeyboardButton(text="🔙 Назад")]],
-        resize_keyboard=True
-    )
-
-    await message.answer("Выбери цель", reply_markup=kb)
-    await state.set_state(Form.boost_target)
-
-
-@dp.message(Form.boost_target)
-async def boost_target(message: Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.clear()
-        await message.answer("Меню", reply_markup=main_menu())
-        return
-
-    await state.update_data(target=message.text)
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="5%"), KeyboardButton(text="10%"), KeyboardButton(text="15%")],
-            [KeyboardButton(text="🔙 Назад")]
-        ],
-        resize_keyboard=True
-    )
-
-    await message.answer("Процент", reply_markup=kb)
-    await state.set_state(Form.boost_percent)
-
-
-@dp.message(Form.boost_percent)
-async def boost_apply(message: Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.set_state(Form.boost_target)
-        return
-
-    percent = int(message.text.replace("%", "")) / 100
-    data = await state.get_data()
-
-    tasks = await get_tasks()
-
-    for t in tasks:
-        if t["nickname"] in data["target"]:
-            if t["user_id"] == message.from_user.id:
-                await message.answer("Нельзя бустить себя")
-                await state.clear()
-                return
-
-            left = seconds_left(t["end_time"])
-            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
-
-            await update_task(t["id"], new_time)
-
-            await bot.send_message(
-                GROUP_CHAT_ID,
-                f"🔥 {message.from_user.id} бустанул {t['nickname']} на {int(percent*100)}%",
-                message_thread_id=TOPIC_ID
-            )
-
-    await send_rating()
-
-    await message.answer("Готово")
-    await state.clear()
-
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Используй кнопки меню")
+    
 
 # ================= RUN =================
 
 async def main():
     await init_db()
-
     asyncio.create_task(rating_loop())
-
     await dp.start_polling(bot)
 
 

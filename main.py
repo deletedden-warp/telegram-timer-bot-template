@@ -1,10 +1,14 @@
+# ====== ИМПОРТЫ ======
 import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message,
+    ReplyKeyboardMarkup, KeyboardButton
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -13,75 +17,71 @@ import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN").strip()
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-GROUP_CHAT_ID = -1003672834247
-THREAD_ID = 5239
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 pool: asyncpg.Pool = None
-last_message_id = None
 
+GROUP_CHAT_ID = -1003672834247  # твоя группа
 
-# ================= FSM =================
+last_rating_message_id = None
 
+# ====== FSM ======
 class Form(StatesGroup):
     nickname = State()
     action = State()
     days = State()
-    delete_one = State()
-    confirm_delete = State()
     boost_type = State()
     boost_target = State()
     boost_percent = State()
+    confirm_delete = State()
+    delete_one = State()
 
 
-# ================= UI =================
-
+# ====== КНОПКИ ======
 def main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🛠 Создать запись")],
-            [KeyboardButton(text="📜 Посмотреть все записи")],
+            [KeyboardButton(text="📜 Мои записи")],
             [KeyboardButton(text="🏆 Рейтинг")],
             [KeyboardButton(text="⚡ Буст")],
-            [KeyboardButton(text="🗑 Удалить одну запись")],
-            [KeyboardButton(text="🧹 Удалить все записи")],
-            [KeyboardButton(text="💀 Удалиться из базы")]
+            [KeyboardButton(text="🗑 Удалить запись"), KeyboardButton(text="💀 Удалиться из базы")]
         ],
         resize_keyboard=True
     )
-
 
 def action_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🏗 Строим"), KeyboardButton(text="🔬 Исследуем")],
-            [KeyboardButton(text="⬅️ Назад")]
+            [KeyboardButton(text="🔙 Назад")]
+        ],
+        resize_keyboard=True
+    )
+
+def back_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🔙 Назад")]],
+        resize_keyboard=True
+    )
+
+def percent_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⚡ Уровень 1: 5%")],
+            [KeyboardButton(text="⚡ Уровень 2: 10%")],
+            [KeyboardButton(text="⚡ Уровень 3: 15%")],
+            [KeyboardButton(text="🔙 Назад")]
         ],
         resize_keyboard=True
     )
 
 
-# ================= UTILS =================
-
-def seconds_left(end):
-    return max(0, int((end - datetime.utcnow()).total_seconds()))
-
-
-def days_left(end):
-    return seconds_left(end) // 86400
-
-
-def icon(t):
-    return "🏗" if "Строим" in t else "🔬"
-
-
-# ================= DB =================
-
+# ====== DB ======
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
@@ -105,22 +105,61 @@ async def init_db():
         """)
 
 
-# ================= DB FUNCS =================
+# ====== УТИЛЫ ======
+def seconds_left(end_time):
+    return int((end_time - datetime.utcnow()).total_seconds())
 
+def format_days(seconds):
+    return f"{max(0, seconds // 86400)} дней"
+
+def icon(action):
+    return "🏗" if action == "Строим" else "🔬"
+
+
+# ====== DB FUNCS ======
 async def get_user(tg_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
-
 
 async def create_user(tg_id, nickname, chat_id):
     async with pool.acquire() as conn:
         await conn.execute("""
         INSERT INTO users (tg_id, nickname, chat_id)
         VALUES ($1,$2,$3)
-        ON CONFLICT (tg_id) DO UPDATE
-        SET nickname=$2, chat_id=$3
+        ON CONFLICT (tg_id)
+        DO UPDATE SET nickname=$2, chat_id=$3
         """, tg_id, nickname, chat_id)
 
+async def delete_user(tg_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
+        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
+
+async def delete_one_task(task_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE id=$1", task_id)
+
+async def delete_tasks(tg_id):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
+
+async def add_task(tg_id, action, days):
+    end_time = datetime.utcnow() + timedelta(days=days)
+
+    async with pool.acquire() as conn:
+        existing = await conn.fetch("""
+        SELECT * FROM tasks WHERE user_id=$1
+        """, tg_id)
+
+        if any(t["action_type"] == action for t in existing):
+            return False
+
+        await conn.execute("""
+        INSERT INTO tasks (user_id, action_type, end_time)
+        VALUES ($1,$2,$3)
+        """, tg_id, action, end_time)
+
+        return True
 
 async def get_tasks():
     async with pool.acquire() as conn:
@@ -130,63 +169,25 @@ async def get_tasks():
         JOIN users u ON u.tg_id = t.user_id
         """)
 
-
 async def get_user_tasks(tg_id):
     async with pool.acquire() as conn:
         return await conn.fetch("""
-        SELECT * FROM tasks WHERE user_id=$1
+        SELECT t.id, u.nickname, t.action_type, t.end_time
+        FROM tasks t
+        JOIN users u ON u.tg_id = t.user_id
+        WHERE t.user_id=$1
         """, tg_id)
 
-
-async def add_task(tg_id, action, days):
-    tasks = await get_user_tasks(tg_id)
-
-    # лимит: 1 тип
-    for t in tasks:
-        if t["action_type"] == action:
-            return False
-
-    if len(tasks) >= 2:
-        return False
-
-    end = datetime.utcnow() + timedelta(days=days)
-
+async def update_task_time(task_id, new_time):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO tasks (user_id, action_type, end_time) VALUES ($1,$2,$3)",
-            tg_id, action, end
-        )
-    return True
+        await conn.execute("""
+        UPDATE tasks SET end_time=$1 WHERE id=$2
+        """, new_time, task_id)
 
 
-async def delete_task(task_id):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM tasks WHERE id=$1", task_id)
-
-
-async def delete_tasks_user(tg_id):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
-
-
-async def delete_user(tg_id):
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
-        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
-
-
-async def update_task(task_id, new_time):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE tasks SET end_time=$1 WHERE id=$2",
-            new_time, task_id
-        )
-
-
-# ================= RATING =================
-
+# ====== РЕЙТИНГ ======
 async def send_rating():
-    global last_message_id
+    global last_rating_message_id
 
     tasks = await get_tasks()
 
@@ -194,11 +195,13 @@ async def send_rating():
     research = []
 
     for t in tasks:
-        d = days_left(t["end_time"])
-        if "Строим" in t["action_type"]:
-            build.append((t["nickname"], d))
+        left = seconds_left(t["end_time"])
+        entry = (t["nickname"], left)
+
+        if t["action_type"] == "Строим":
+            build.append(entry)
         else:
-            research.append((t["nickname"], d))
+            research.append(entry)
 
     build.sort(key=lambda x: x[1], reverse=True)
     research.sort(key=lambda x: x[1], reverse=True)
@@ -206,42 +209,34 @@ async def send_rating():
     text = "🏆 Рейтинг\n\n"
 
     text += "🏗 Стройка:\n"
-    for i, t in enumerate(build, 1):
-        text += f"{i}) {t[0]} — {t[1]} дн\n"
+    for i, (nick, sec) in enumerate(build, 1):
+        text += f"{i}) {nick} — {format_days(sec)}\n"
 
     text += "\n🔬 Исследования:\n"
-    for i, t in enumerate(research, 1):
-        text += f"{i}) {t[0]} — {t[1]} дн\n"
+    for i, (nick, sec) in enumerate(research, 1):
+        text += f"{i}) {nick} — {format_days(sec)}\n"
 
-    # удаляем старое сообщение
     try:
-        if last_message_id:
-            await bot.delete_message(GROUP_CHAT_ID, last_message_id)
+        if last_rating_message_id:
+            await bot.delete_message(GROUP_CHAT_ID, last_rating_message_id)
     except:
         pass
 
-    msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=THREAD_ID)
-    last_message_id = msg.message_id
+    msg = await bot.send_message(GROUP_CHAT_ID, text)
+    last_rating_message_id = msg.message_id
 
 
-async def auto_rating():
-    while True:
-        await asyncio.sleep(14400)
-        await send_rating()
-
-
-# ================= HANDLERS =================
-
+# ====== МЕНЮ ======
 @dp.message(F.text.in_({"/start", "/menu"}))
-async def start(message: Message, state: FSMContext):
+async def menu(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
 
     if not user:
-        await message.answer("Введи ник")
+        await message.answer("Введи ник:")
         await state.set_state(Form.nickname)
         return
 
-    await message.answer("Меню", reply_markup=main_menu())
+    await message.answer("Меню:", reply_markup=main_menu())
 
 
 @dp.message(Form.nickname)
@@ -251,8 +246,7 @@ async def reg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= CREATE =================
-
+# ====== СОЗДАНИЕ ======
 @dp.message(F.text == "🛠 Создать запись")
 async def create(message: Message, state: FSMContext):
     await message.answer("Выбери действие", reply_markup=action_menu())
@@ -261,165 +255,98 @@ async def create(message: Message, state: FSMContext):
 
 @dp.message(Form.action)
 async def action(message: Message, state: FSMContext):
-    if message.text == "⬅️ Назад":
+    if message.text == "🔙 Назад":
         await message.answer("Меню", reply_markup=main_menu())
         await state.clear()
         return
 
     await state.update_data(action=message.text)
-    await message.answer("Сколько дней?")
+    await message.answer("Сколько дней?", reply_markup=back_menu())
     await state.set_state(Form.days)
 
 
 @dp.message(Form.days)
 async def days(message: Message, state: FSMContext):
-    data = await state.get_data()
-
-    ok = await add_task(message.from_user.id, data["action"], int(message.text))
-
-    if not ok:
-        await message.answer("❌ Лимит или уже есть такая запись", reply_markup=main_menu())
-        await state.clear()
+    if message.text == "🔙 Назад":
+        await message.answer("Выбери действие", reply_markup=action_menu())
+        await state.set_state(Form.action)
         return
 
-    await message.answer("✅ Создано", reply_markup=main_menu())
-    await send_rating()
-    await state.clear()
+    if not message.text.isdigit():
+        return
 
+    data = await state.get_data()
+    success = await add_task(message.from_user.id, data["action"], int(message.text))
 
-# ================= DELETE ONE =================
-
-@dp.message(F.text == "🗑 Удалить одну запись")
-async def delete_one(message: Message, state: FSMContext):
-    tasks = await get_tasks()
-
-    kb = [[KeyboardButton(text=f"{t['id']} | {t['nickname']} | {icon(t['action_type'])}")]
-          for t in tasks if t["user_id"] == message.from_user.id]
-
-    await message.answer("Выбери запись", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
-    await state.set_state(Form.delete_one)
-
-
-@dp.message(Form.delete_one)
-async def delete_one_apply(message: Message, state: FSMContext):
-    task_id = int(message.text.split(" | ")[0])
-    await delete_task(task_id)
-
-    await message.answer("Удалено", reply_markup=main_menu())
-    await send_rating()
-    await state.clear()
-
-
-# ================= DELETE ALL =================
-
-@dp.message(F.text == "🧹 Удалить все записи")
-async def delete_all(message: Message):
-    await delete_tasks_user(message.from_user.id)
-    await message.answer("Удалено всё", reply_markup=main_menu())
-    await send_rating()
-
-
-# ================= DELETE USER =================
-
-@dp.message(F.text == "💀 Удалиться из базы")
-async def delete_confirm(message: Message, state: FSMContext):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✅ Да"), KeyboardButton(text="❌ Нет")]
-        ],
-        resize_keyboard=True
-    )
-    await message.answer("Ты уверен?", reply_markup=kb)
-    await state.set_state(Form.confirm_delete)
-
-
-@dp.message(Form.confirm_delete)
-async def delete_final(message: Message, state: FSMContext):
-    if "Да" in message.text:
-        await delete_user(message.from_user.id)
-        await message.answer("Удалён", reply_markup=main_menu())
-        await send_rating()
+    if not success:
+        await message.answer("❌ Уже есть такая запись")
     else:
-        await message.answer("Отмена", reply_markup=main_menu())
+        await message.answer("✅ Создано")
+        await send_rating()
 
+    await message.answer("Меню", reply_markup=main_menu())
     await state.clear()
 
 
-# ================= BOOST =================
+# ====== МОИ ЗАПИСИ ======
+@dp.message(F.text == "📜 Мои записи")
+async def my_tasks(message: Message):
+    tasks = await get_user_tasks(message.from_user.id)
 
-@dp.message(F.text == "⚡ Буст")
-async def boost_start(message: Message, state: FSMContext):
-    await message.answer("Тип?", reply_markup=action_menu())
-    await state.set_state(Form.boost_type)
-
-
-@dp.message(Form.boost_type)
-async def boost_type(message: Message, state: FSMContext):
-    await state.update_data(type=message.text)
-
-    tasks = await get_tasks()
-
-    kb = [[KeyboardButton(text=f"{t['nickname']} | {icon(t['action_type'])} | {days_left(t['end_time'])} д")]
-          for t in tasks]
-
-    await message.answer("Кого бустим?", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
-    await state.set_state(Form.boost_target)
-
-
-@dp.message(Form.boost_target)
-async def boost_target(message: Message, state: FSMContext):
-    nickname = message.text.split(" | ")[0]
-
-    user = await get_user(message.from_user.id)
-    if user["nickname"] == nickname:
-        await message.answer("❌ Нельзя бустить себя", reply_markup=main_menu())
-        await state.clear()
+    if not tasks:
+        await message.answer("❌ У тебя нет записей")
         return
 
-    await state.update_data(target=nickname)
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="5%")],
-            [KeyboardButton(text="10%")],
-            [KeyboardButton(text="15%")]
-        ],
-        resize_keyboard=True
-    )
-
-    await message.answer("Процент?", reply_markup=kb)
-    await state.set_state(Form.boost_percent)
-
-
-@dp.message(Form.boost_percent)
-async def boost_apply(message: Message, state: FSMContext):
-    data = await state.get_data()
-    percent = int(message.text.replace("%", "")) / 100
-
-    tasks = await get_tasks()
-    attacker = (await get_user(message.from_user.id))["nickname"]
+    text = "📜 Твои записи:\n\n"
 
     for t in tasks:
-        if t["nickname"] == data["target"]:
-            left = seconds_left(t["end_time"])
-            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
-            await update_task(t["id"], new_time)
+        left = seconds_left(t["end_time"])
+        text += f"{icon(t['action_type'])} {t['action_type']} — {format_days(left)}\n"
 
-            await bot.send_message(
-                GROUP_CHAT_ID,
-                f"🎉 {attacker} бустанул {t['nickname']} на {int(percent*100)}%",
-                message_thread_id=THREAD_ID
-            )
-
-    await send_rating()
-    await message.answer("Готово", reply_markup=main_menu())
-    await state.clear()
+    await bot.send_message(message.from_user.id, text)
 
 
-# ================= RUN =================
+# ====== РЕЙТИНГ В ЛС ======
+@dp.message(F.text == "🏆 Рейтинг")
+async def rating_private(message: Message):
+    tasks = await get_tasks()
 
+    build = []
+    research = []
+
+    for t in tasks:
+        left = seconds_left(t["end_time"])
+        entry = (t["nickname"], left)
+
+        if t["action_type"] == "Строим":
+            build.append(entry)
+        else:
+            research.append(entry)
+
+    build.sort(key=lambda x: x[1], reverse=True)
+    research.sort(key=lambda x: x[1], reverse=True)
+
+    text = "🏆 Рейтинг\n\n"
+
+    text += "🏗 Стройка:\n"
+    for i, (nick, sec) in enumerate(build, 1):
+        text += f"{i}) {nick} — {format_days(sec)}\n"
+
+    text += "\n🔬 Исследования:\n"
+    for i, (nick, sec) in enumerate(research, 1):
+        text += f"{i}) {nick} — {format_days(sec)}\n"
+
+    await bot.send_message(message.from_user.id, text)
+
+
+# ====== RUN ======
 async def main():
     await init_db()
+
+    async def auto_rating():
+        while True:
+            await asyncio.sleep(14400)
+            await send_rating()
 
     asyncio.create_task(auto_rating())
 

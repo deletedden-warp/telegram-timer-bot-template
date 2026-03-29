@@ -91,6 +91,18 @@ def action_menu():
     )
 
 
+def percent_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Уровень 1: 5%")],
+            [KeyboardButton(text="Уровень 2: 10%")],
+            [KeyboardButton(text="Уровень 3: 15%")],
+            [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 Главное меню")]
+        ],
+        resize_keyboard=True
+    )
+
+
 # ================= UTILS =================
 
 def normalize_type(action: str):
@@ -109,7 +121,7 @@ def format_days(seconds):
     return f"{max(0, seconds // 86400)} дней"
 
 
-# ================= DB FUNCS =================
+# ================= DB =================
 
 async def get_user(tg_id):
     async with pool.acquire() as conn:
@@ -143,6 +155,14 @@ async def get_tasks():
         """)
 
 
+async def update_task_time(task_id, new_time):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tasks SET end_time=$1 WHERE id=$2",
+            new_time, task_id
+        )
+
+
 async def delete_user_tasks(tg_id):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
@@ -167,10 +187,7 @@ async def send_group_report():
             left = seconds_left(t["end_time"])
             text += f"{t['nickname']} | {t['action_type']} | {format_days(left)}\n"
 
-    try:
-        await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=GROUP_THREAD_ID)
-    except Exception as e:
-        logging.error(e)
+    await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=GROUP_THREAD_ID)
 
 
 # ================= HANDLERS =================
@@ -227,58 +244,10 @@ async def days(message: Message, state: FSMContext):
     await send_group_report()
 
 
-# ================= LIST =================
-
-@dp.message(F.text == "📜 Посмотреть все записи")
-async def list_tasks(message: Message):
-    tasks = await get_tasks()
-
-    text = ""
-    for t in tasks:
-        left = seconds_left(t["end_time"])
-        text += f"{t['nickname']} | {t['action_type']} | {format_days(left)}\n"
-
-    await message.answer(text or "Пусто")
-
-
-# ================= RATING =================
-
-@dp.message(F.text == "🏆 Рейтинг")
-async def rating(message: Message):
-    tasks = await get_tasks()
-
-    build = []
-    research = []
-
-    for t in tasks:
-        left = seconds_left(t["end_time"])
-        days = left // 86400
-
-        t_type = normalize_type(t["action_type"])
-
-        if t_type == "build":
-            build.append((t["nickname"], days))
-        elif t_type == "research":
-            research.append((t["nickname"], days))
-
-    build.sort(key=lambda x: x[1], reverse=True)
-    research.sort(key=lambda x: x[1], reverse=True)
-
-    text = "🏆 Стройка:\n"
-    for i, (n, d) in enumerate(build, 1):
-        text += f"{i}) {n} — {d} дней\n"
-
-    text += "\n🔬 Исследования:\n"
-    for i, (n, d) in enumerate(research, 1):
-        text += f"{i}) {n} — {d} дней\n"
-
-    await message.answer(text)
-
-
 # ================= BOOST =================
 
 @dp.message(F.text == "⚡ Буст")
-async def boost(message: Message):
+async def boost(message: Message, state: FSMContext):
     tasks = await get_tasks()
 
     kb = ReplyKeyboardMarkup(
@@ -290,7 +259,7 @@ async def boost(message: Message):
     )
 
     await message.answer("Выбери цель", reply_markup=kb)
-    dp.current_state().set_state(Form.attack_target)
+    await state.set_state(Form.attack_target)
 
 
 @dp.message(Form.attack_target)
@@ -299,26 +268,42 @@ async def boost_target(message: Message, state: FSMContext):
 
     tasks = await get_tasks()
 
+    kb = percent_menu()
+
+    await state.update_data(target=target)
+    await message.answer("Выбери уровень буста", reply_markup=kb)
+    await state.set_state(Form.attack_percent)
+
+
+@dp.message(Form.attack_percent)
+async def boost_apply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    percent = 0.05 if "1" in message.text else 0.1 if "2" in message.text else 0.15
+
+    tasks = await get_tasks()
+
+    attacker = await get_user(message.from_user.id)
+
     for t in tasks:
-        if t["nickname"] == target:
-
-            if t["user_id"] == message.from_user.id:
-                await message.answer("❌ Нельзя бустить себя")
-                await state.clear()
-                return
-
-            percent = 0.15
+        if t["nickname"] == data["target"]:
 
             left = seconds_left(t["end_time"])
-            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
+            new_left = left * (1 - percent)
+            new_time = datetime.utcnow() + timedelta(seconds=new_left)
 
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE tasks SET end_time=$1 WHERE id=$2",
-                    new_time, t["id"]
-                )
+            await update_task_time(t["id"], new_time)
 
-    await message.answer("⚡ Буст применен")
+            # текст
+            days_left = int(new_left // 86400)
+
+            if "Строим" in t["action_type"]:
+                text = f"Ура! {attacker['nickname']} применил буст на {t['nickname']} на {int(percent*100)}%, теперь ему осталось строить {days_left} дней."
+            else:
+                text = f"Ура! {attacker['nickname']} применил буст на {t['nickname']} на {int(percent*100)}%, теперь ему осталось исследовать {days_left} дней."
+
+            await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=GROUP_THREAD_ID)
+
+    await message.answer("⚡ Буст применен", reply_markup=main_menu())
     await state.clear()
 
     await send_group_report()

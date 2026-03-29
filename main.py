@@ -19,13 +19,8 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-print("TOKEN RAW:", repr(BOT_TOKEN))
-
 if BOT_TOKEN:
     BOT_TOKEN = BOT_TOKEN.strip().replace('"', '')
-
-if not BOT_TOKEN or ":" not in BOT_TOKEN:
-    raise ValueError(f"❌ TOKEN BROKEN: {repr(BOT_TOKEN)}")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -85,7 +80,17 @@ def main_menu():
 def action_menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🏗 Строим"), KeyboardButton(text="🔬 Исследуем")]
+            [KeyboardButton(text="🏗 Строим"), KeyboardButton(text="🔬 Исследуем")],
+            [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 Главное меню")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def back_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 Главное меню")]
         ],
         resize_keyboard=True
     )
@@ -155,6 +160,48 @@ async def update_task_time(task_id, new_time):
         )
 
 
+# ================= NAVIGATION =================
+
+@dp.message(F.text == "🏠 Главное меню")
+async def to_main(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Главное меню", reply_markup=main_menu())
+
+
+@dp.message(F.text == "⬅️ Назад")
+async def go_back(message: Message, state: FSMContext):
+    current = await state.get_state()
+
+    if current == Form.action.state:
+        await state.clear()
+        await message.answer("Главное меню", reply_markup=main_menu())
+
+    elif current == Form.days.state:
+        await state.set_state(Form.action)
+        await message.answer("Выбери действие", reply_markup=action_menu())
+
+    elif current == Form.attack_target.state:
+        await state.clear()
+        await message.answer("Главное меню", reply_markup=main_menu())
+
+    elif current == Form.attack_percent.state:
+        await state.set_state(Form.attack_target)
+
+        tasks = await get_tasks()
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=t["nickname"])] for t in tasks] + [
+                [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 Главное меню")]
+            ],
+            resize_keyboard=True
+        )
+
+        await message.answer("Выбери игрока", reply_markup=kb)
+
+    else:
+        await state.clear()
+        await message.answer("Главное меню", reply_markup=main_menu())
+
+
 # ================= HANDLERS =================
 
 @dp.message(F.text.in_({"/start", "/menu"}))
@@ -172,7 +219,6 @@ async def menu(message: Message, state: FSMContext):
 @dp.message(Form.nickname)
 async def reg(message: Message, state: FSMContext):
     await create_user(message.from_user.id, message.text, message.chat.id)
-
     await message.answer("✅ Ты зарегистрирован", reply_markup=main_menu())
     await state.clear()
 
@@ -187,6 +233,9 @@ async def create(message: Message, state: FSMContext):
 
 @dp.message(Form.action)
 async def action(message: Message, state: FSMContext):
+    if message.text in ["⬅️ Назад", "🏠 Главное меню"]:
+        return
+
     if "Строим" in message.text:
         action = "Строим"
     elif "Исследуем" in message.text:
@@ -196,12 +245,15 @@ async def action(message: Message, state: FSMContext):
         return
 
     await state.update_data(action=action)
-    await message.answer("Сколько дней?")
+    await message.answer("Сколько дней?", reply_markup=back_menu())
     await state.set_state(Form.days)
 
 
 @dp.message(Form.days)
 async def days(message: Message, state: FSMContext):
+    if message.text in ["⬅️ Назад", "🏠 Главное меню"]:
+        return
+
     if not message.text.isdigit():
         await message.answer("Введи число")
         return
@@ -210,7 +262,7 @@ async def days(message: Message, state: FSMContext):
 
     await add_task(message.from_user.id, data["action"], int(message.text))
 
-    await message.answer("✅ Запись создана")
+    await message.answer("✅ Запись создана", reply_markup=main_menu())
     await state.clear()
 
 
@@ -251,7 +303,9 @@ async def attack(message: Message, state: FSMContext):
         return
 
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t["nickname"])] for t in tasks],
+        keyboard=[[KeyboardButton(text=t["nickname"])] for t in tasks] + [
+            [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 Главное меню")]
+        ],
         resize_keyboard=True
     )
 
@@ -261,18 +315,22 @@ async def attack(message: Message, state: FSMContext):
 
 @dp.message(Form.attack_target)
 async def attack_target(message: Message, state: FSMContext):
+    if message.text in ["⬅️ Назад", "🏠 Главное меню"]:
+        return
+
     await state.update_data(target=message.text)
 
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Уровень 1: 5%")],
             [KeyboardButton(text="Уровень 2: 10%")],
-            [KeyboardButton(text="Уровень 3: 15%")]
+            [KeyboardButton(text="Уровень 3: 15%")],
+            [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="🏠 Главное меню")]
         ],
         resize_keyboard=True
     )
 
-    await message.answer("Выбери уровень атаки", reply_markup=kb)
+    await message.answer("Выбери уровень", reply_markup=kb)
     await state.set_state(Form.attack_percent)
 
 
@@ -290,13 +348,13 @@ async def attack_apply(message: Message, state: FSMContext):
             new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
             await update_task_time(t["id"], new_time)
 
-    await message.answer("⚔️ Атака применена")
+    await message.answer("⚔️ Атака применена", reply_markup=main_menu())
     await state.clear()
 
 
 # ================= FALLBACK =================
 
-@dp.message()
+@dp.message(F.text & ~F.state)
 async def fallback(message: Message):
     await message.answer("Напиши /menu")
 

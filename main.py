@@ -154,8 +154,9 @@ async def delete_tasks_user(tg_id):
 
 async def delete_user(tg_id):
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
         await conn.execute("DELETE FROM tasks WHERE user_id=$1", tg_id)
+        result = await conn.execute("DELETE FROM users WHERE tg_id=$1", tg_id)
+        return result
 
 
 # ================= TIMER =================
@@ -210,177 +211,22 @@ async def reg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= CREATE =================
-
-@dp.message(F.text == "🛠 Создать запись")
-async def create(message: Message, state: FSMContext):
-    await message.answer("Выбери действие", reply_markup=action_menu())
-    await state.set_state(Form.action)
-
-
-@dp.message(Form.action)
-async def action(message: Message, state: FSMContext):
-    if message.text == "⬅️ Назад":
-        await message.answer("Меню", reply_markup=main_menu())
-        await state.clear()
-        return
-
-    await state.update_data(action=message.text)
-    await message.answer("Сколько дней?")
-    await state.set_state(Form.days)
-
-
-@dp.message(Form.days)
-async def days(message: Message, state: FSMContext):
-    data = await state.get_data()
-    await add_task(message.from_user.id, data["action"], int(message.text))
-
-    await message.answer("Создано", reply_markup=main_menu())
-    await send_life_table()
-    await state.clear()
-
-
-# ================= DELETE TASKS =================
-
-@dp.message(F.text == "🗑 Удалить свои записи")
-async def delete_my_tasks(message: Message):
-    await delete_tasks_user(message.from_user.id)
-    await message.answer("🗑 Все твои записи удалены", reply_markup=main_menu())
-    await send_life_table()
-
-
-# ================= DELETE USER =================
+# ================= DELETE USER FIX =================
 
 @dp.message(F.text == "💀 Удалиться из базы")
-async def delete_me(message: Message):
-    await delete_user(message.from_user.id)
-    await message.answer("💀 Ты удалён из базы")
-    
-
-# ================= LIST =================
-
-@dp.message(F.text == "📜 Посмотреть все записи")
-async def list_tasks(message: Message):
-    tasks = await get_tasks()
-
-    text = ""
-    for t in tasks:
-        left = format_days(seconds_left(t["end_time"]))
-        text += f"{t['nickname']} | {icon(t['action_type'])} | {left} дней\n"
-
-    await bot.send_message(message.from_user.id, text)
-
-
-# ================= RATING =================
-
-@dp.message(F.text == "🏆 Рейтинг")
-async def rating(message: Message):
-    tasks = await get_tasks()
-
-    build = []
-    research = []
-
-    for t in tasks:
-        left = format_days(seconds_left(t["end_time"]))
-        if "Строим" in t["action_type"]:
-            build.append((t["nickname"], left))
-        else:
-            research.append((t["nickname"], left))
-
-    build.sort(key=lambda x: x[1], reverse=True)
-    research.sort(key=lambda x: x[1], reverse=True)
-
-    text = "🏗 Стройка:\n"
-    for i, t in enumerate(build, 1):
-        text += f"{i}) {t[0]} — {t[1]} дней\n"
-
-    text += "\n🔬 Исследования:\n"
-    for i, t in enumerate(research, 1):
-        text += f"{i}) {t[0]} — {t[1]} дней\n"
-
-    await bot.send_message(message.from_user.id, text)
-
-
-# ================= BOOST =================
-
-@dp.message(F.text == "⚡ Буст")
-async def boost_start(message: Message, state: FSMContext):
-    await message.answer("Тип?", reply_markup=action_menu())
-    await state.set_state(Form.boost_type)
-
-
-@dp.message(Form.boost_type)
-async def boost_type(message: Message, state: FSMContext):
-    await state.update_data(type=message.text)
-
-    tasks = await get_tasks()
-
-    kb = [[KeyboardButton(text=f"{t['nickname']} | {icon(t['action_type'])} | {format_days(seconds_left(t['end_time']))} д")] for t in tasks]
-
-    kb.append([KeyboardButton(text="⬅️ Назад")])
-
-    await message.answer("Кого бустим?", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
-    await state.set_state(Form.boost_target)
-
-
-@dp.message(Form.boost_target)
-async def boost_target(message: Message, state: FSMContext):
-    if message.text == "⬅️ Назад":
-        await message.answer("Меню", reply_markup=main_menu())
-        await state.clear()
-        return
-
-    nickname = message.text.split(" | ")[0]
-
+async def delete_me(message: Message, state: FSMContext):
     user = await get_user(message.from_user.id)
-    if user["nickname"] == nickname:
-        await message.answer("❌ Нельзя бустить себя", reply_markup=main_menu())
-        await state.clear()
+
+    if not user:
+        await message.answer("⚠️ Ты уже удалён")
         return
 
-    await state.update_data(target=nickname)
+    await delete_user(message.from_user.id)
 
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="5%")],
-            [KeyboardButton(text="10%")],
-            [KeyboardButton(text="15%")],
-            [KeyboardButton(text="⬅️ Назад")]
-        ],
-        resize_keyboard=True
-    )
-
-    await message.answer("Процент?", reply_markup=kb)
-    await state.set_state(Form.boost_percent)
-
-
-@dp.message(Form.boost_percent)
-async def boost_apply(message: Message, state: FSMContext):
-    data = await state.get_data()
-    percent = int(message.text.replace("%", "")) / 100
-
-    tasks = await get_tasks()
-
-    attacker = (await get_user(message.from_user.id))["nickname"]
-
-    for t in tasks:
-        if t["nickname"] == data["target"]:
-            left = seconds_left(t["end_time"])
-            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
-            await update_task_time(t["id"], new_time)
-
-            days = format_days(seconds_left(new_time))
-            action_text = "строить" if "Строим" in t["action_type"] else "исследовать"
-
-            await bot.send_message(
-                GROUP_CHAT_ID,
-                f"🎉 {attacker} применил буст на {t['nickname']} ({int(percent*100)}%)\n"
-                f"Теперь ему осталось {action_text} {days} дней",
-                message_thread_id=THREAD_ID
-            )
+    await message.answer("💀 Ты полностью удалён из базы")
 
     await send_life_table()
-    await message.answer("Готово", reply_markup=main_menu())
+
     await state.clear()
 
 

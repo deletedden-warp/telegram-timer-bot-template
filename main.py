@@ -31,7 +31,6 @@ pool = None
 last_rating_message_id = None
 last_boost_stats_message_id = None
 
-
 # ================= DB =================
 
 async def init_db():
@@ -59,10 +58,9 @@ async def init_db():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS boost_stats (
             user_id BIGINT PRIMARY KEY,
-            boost_count INT DEFAULT 0
+            boosts INTEGER DEFAULT 0
         );
         """)
-
 
 # ================= FSM =================
 
@@ -75,7 +73,6 @@ class Form(StatesGroup):
     boost_percent = State()
     delete_select = State()
     confirm_user_delete = State()
-
 
 # ================= KEYBOARDS =================
 
@@ -91,7 +88,6 @@ def main_menu():
         resize_keyboard=True
     )
 
-
 # ================= UTILS =================
 
 def seconds_left(end):
@@ -103,6 +99,12 @@ def days_left(end):
 def icon(t):
     return "🏗" if "Стро" in t else "🔬"
 
+async def delete_message_later(chat_id, message_id, delay=43200):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except:
+        pass
 
 # ================= HELPERS =================
 
@@ -121,8 +123,7 @@ async def get_user_tasks(tg_id):
     async with pool.acquire() as conn:
         return await conn.fetch("SELECT * FROM tasks WHERE user_id=$1", tg_id)
 
-
-# ================= TIMER =================
+# ================= CLEANUP =================
 
 async def cleanup_tasks():
     while True:
@@ -130,18 +131,10 @@ async def cleanup_tasks():
             await conn.execute("DELETE FROM tasks WHERE end_time < NOW()")
         await asyncio.sleep(60)
 
-
-async def delete_later(chat_id, message_id, seconds):
-    await asyncio.sleep(seconds)
-    try:
-        await bot.delete_message(chat_id, message_id)
-    except:
-        pass
-
-
 # ================= RATING =================
 
 async def send_rating():
+
     global last_rating_message_id
 
     tasks = await get_tasks()
@@ -175,29 +168,33 @@ async def send_rating():
         pass
 
     msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=TOPIC_ID)
-    last_rating_message_id = msg.message_id
 
+    last_rating_message_id = msg.message_id
 
 # ================= BOOST STATS =================
 
 async def send_boost_stats():
+
     global last_boost_stats_message_id
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-        SELECT u.nickname, b.boost_count
+
+        stats = await conn.fetch("""
+        SELECT u.nickname, b.boosts
         FROM boost_stats b
         JOIN users u ON u.tg_id=b.user_id
-        ORDER BY b.boost_count DESC
+        ORDER BY b.boosts DESC
         """)
 
-    if not rows:
+    if not stats:
         return
 
-    text = "🚀 Статистика ускорений\n\n"
+    text = "⚡ Статистика бустов\n\n"
 
-    for i, r in enumerate(rows, 1):
-        text += f"{i}) {r['nickname']} ускорил союзников {r['boost_count']} раз ⚡\n"
+    i = 1
+    for s in stats:
+        text += f"{i}) 🚀 {s['nickname']} ускорил союзников {s['boosts']} раз\n"
+        i += 1
 
     try:
         if last_boost_stats_message_id:
@@ -206,8 +203,14 @@ async def send_boost_stats():
         pass
 
     msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=TOPIC_ID)
+
     last_boost_stats_message_id = msg.message_id
 
+async def stats_loop():
+    while True:
+        await send_rating()
+        await send_boost_stats()
+        await asyncio.sleep(14400)
 
 # ================= START =================
 
@@ -223,11 +226,11 @@ async def start(message: Message, state: FSMContext):
 
     await message.answer("Меню", reply_markup=main_menu())
 
-
 @dp.message(Form.nickname)
 async def reg(message: Message, state: FSMContext):
 
     async with pool.acquire() as conn:
+
         await conn.execute(
             "INSERT INTO users (tg_id, nickname) VALUES ($1,$2) ON CONFLICT DO NOTHING",
             message.from_user.id, message.text
@@ -236,13 +239,13 @@ async def reg(message: Message, state: FSMContext):
     await message.answer("Готово", reply_markup=main_menu())
     await state.clear()
 
-
 # ================= CREATE =================
 
 @dp.message(F.text == "🛠 Создать запись")
 async def create(message: Message, state: FSMContext):
 
     tasks = await get_user_tasks(message.from_user.id)
+
     types = [t['action_type'] for t in tasks]
 
     buttons = []
@@ -254,14 +257,26 @@ async def create(message: Message, state: FSMContext):
         buttons.append([KeyboardButton(text="🔬 Исследуем")])
 
     if not buttons:
-        await message.answer("У тебя уже есть обе записи", reply_markup=main_menu())
+
+        kb = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🗑 Удалить запись")],
+                [KeyboardButton(text="🔙 Назад")]
+            ],
+            resize_keyboard=True
+        )
+
+        await message.answer("У тебя уже есть обе записи", reply_markup=kb)
         return
 
     buttons.append([KeyboardButton(text="🔙 Назад")])
 
-    await message.answer("Что создаём?", reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True))
-    await state.set_state(Form.action)
+    await message.answer(
+        "Что создаём?",
+        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+    )
 
+    await state.set_state(Form.action)
 
 @dp.message(Form.action)
 async def action(message: Message, state: FSMContext):
@@ -272,9 +287,10 @@ async def action(message: Message, state: FSMContext):
         return
 
     await state.update_data(action=message.text)
-    await message.answer("Сколько дней?")
-    await state.set_state(Form.days)
 
+    await message.answer("Сколько дней?")
+
+    await state.set_state(Form.days)
 
 @dp.message(Form.days)
 async def days(message: Message, state: FSMContext):
@@ -284,18 +300,21 @@ async def days(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
+
     end = datetime.utcnow() + timedelta(days=int(message.text))
 
     async with pool.acquire() as conn:
+
         await conn.execute(
             "INSERT INTO tasks (user_id, action_type, end_time) VALUES ($1,$2,$3)",
             message.from_user.id, data["action"], end
         )
 
     await message.answer("Создано ✅", reply_markup=main_menu())
-    await send_rating()
-    await state.clear()
 
+    await send_rating()
+
+    await state.clear()
 
 # ================= MY TASKS =================
 
@@ -308,10 +327,11 @@ async def my_tasks(message: Message):
         await message.answer("Записей нет", reply_markup=main_menu())
         return
 
-    text = "\n".join([f"{icon(t['action_type'])} — {days_left(t['end_time'])} д" for t in tasks])
+    text = "\n".join(
+        [f"{icon(t['action_type'])} — {days_left(t['end_time'])} д" for t in tasks]
+    )
 
     await message.answer(text, reply_markup=main_menu())
-
 
 # ================= BOOST =================
 
@@ -321,40 +341,56 @@ async def boost_start(message: Message, state: FSMContext):
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🏗 Стройка")],
-            [KeyboardButton(text="🔬 Исследования")]
+            [KeyboardButton(text="🔬 Исследования")],
+            [KeyboardButton(text="🔙 Назад")]
         ],
         resize_keyboard=True
     )
 
     await message.answer("Выбери тип", reply_markup=kb)
-    await state.set_state(Form.boost_type)
 
+    await state.set_state(Form.boost_type)
 
 @dp.message(Form.boost_type)
 async def boost_type(message: Message, state: FSMContext):
+
+    if message.text == "🔙 Назад":
+        await state.clear()
+        await message.answer("Меню", reply_markup=main_menu())
+        return
 
     tasks = await get_tasks()
 
     filtered = [
         t for t in tasks
-        if t["user_id"] != message.from_user.id and (
-            ("Стро" in message.text and "Стро" in t["action_type"]) or
-            ("Исслед" in message.text and "Исслед" in t["action_type"])
-        )
+        if t["user_id"] != message.from_user.id and
+        (("Стро" in message.text and "Стро" in t["action_type"]) or
+         ("Исслед" in message.text and "Исслед" in t["action_type"]))
     ]
 
+    if not filtered:
+        await message.answer("Нет целей для буста", reply_markup=main_menu())
+        await state.clear()
+        return
+
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=f"ID {t['id']} {t['nickname']}")] for t in filtered],
+        keyboard=[[KeyboardButton(text=f"ID {t['id']} {t['nickname']}")] for t in filtered] + [[KeyboardButton(text="🔙 Назад")]],
         resize_keyboard=True
     )
 
     await state.update_data(filtered_tasks=filtered)
-    await message.answer("Выбери цель", reply_markup=kb)
-    await state.set_state(Form.boost_target)
 
+    await message.answer("Выбери цель", reply_markup=kb)
+
+    await state.set_state(Form.boost_target)
 
 @dp.message(Form.boost_target)
 async def boost_target(message: Message, state: FSMContext):
+
+    if message.text == "🔙 Назад":
+        await state.clear()
+        await message.answer("Меню", reply_markup=main_menu())
+        return
 
     data = await state.get_data()
 
@@ -373,8 +409,8 @@ async def boost_target(message: Message, state: FSMContext):
     )
 
     await message.answer("Выбери уровень", reply_markup=kb)
-    await state.set_state(Form.boost_percent)
 
+    await state.set_state(Form.boost_percent)
 
 @dp.message(Form.boost_percent)
 async def boost_apply(message: Message, state: FSMContext):
@@ -395,10 +431,13 @@ async def boost_apply(message: Message, state: FSMContext):
         return
 
     percent = percent_map[message.text]
+
     data = await state.get_data()
-    target = data['target']
+
+    target = data.get("target")
 
     async with pool.acquire() as conn:
+
         async with conn.transaction():
 
             target_task = await conn.fetchrow(
@@ -406,7 +445,13 @@ async def boost_apply(message: Message, state: FSMContext):
                 target['id']
             )
 
+            if target_task['user_id'] == message.from_user.id:
+                await message.answer("Нельзя бустить себя")
+                await state.clear()
+                return
+
             left = seconds_left(target_task['end_time'])
+
             new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
 
             await conn.execute(
@@ -415,10 +460,10 @@ async def boost_apply(message: Message, state: FSMContext):
             )
 
             await conn.execute("""
-            INSERT INTO boost_stats (user_id, boost_count)
+            INSERT INTO boost_stats (user_id, boosts)
             VALUES ($1,1)
             ON CONFLICT (user_id)
-            DO UPDATE SET boost_count = boost_stats.boost_count + 1
+            DO UPDATE SET boosts = boost_stats.boosts + 1
             """, message.from_user.id)
 
             user = await conn.fetchrow(
@@ -438,32 +483,54 @@ async def boost_apply(message: Message, state: FSMContext):
 
     msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=TOPIC_ID)
 
-    asyncio.create_task(delete_later(GROUP_CHAT_ID, msg.message_id, 43200))
+    asyncio.create_task(delete_message_later(GROUP_CHAT_ID, msg.message_id))
 
-    await message.answer("Буст выполнен ✅")
-    await send_rating()
     await send_boost_stats()
+
+    await message.answer("Буст выполнен ✅", reply_markup=main_menu())
+
+    await send_rating()
 
     await state.clear()
 
+# ================= BOOST STATS BUTTON =================
+
+@dp.message(F.text == "📈 Статистика бустов")
+async def boost_stats_pm(message: Message):
+
+    async with pool.acquire() as conn:
+
+        stats = await conn.fetch("""
+        SELECT u.nickname, b.boosts
+        FROM boost_stats b
+        JOIN users u ON u.tg_id=b.user_id
+        ORDER BY b.boosts DESC
+        """)
+
+    if not stats:
+        await message.answer("Пока никто не бустил")
+        return
+
+    text = "⚡ Статистика бустов\n\n"
+
+    i = 1
+
+    for s in stats:
+        text += f"{i}) 🚀 {s['nickname']} ускорил союзников {s['boosts']} раз\n"
+        i += 1
+
+    await message.answer(text)
 
 # ================= RUN =================
 
-async def rating_loop():
-    while True:
-        await send_rating()
-        await send_boost_stats()
-        await asyncio.sleep(14400)
-
-
 async def main():
+
     await init_db()
 
-    asyncio.create_task(rating_loop())
     asyncio.create_task(cleanup_tasks())
+    asyncio.create_task(stats_loop())
 
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

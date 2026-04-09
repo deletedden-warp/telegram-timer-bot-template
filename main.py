@@ -29,6 +29,7 @@ TOPIC_ID = 5239
 
 pool = None
 last_rating_message_id = None
+last_boost_stats_message_id = None
 
 
 # ================= DB =================
@@ -101,10 +102,6 @@ def days_left(end):
     return seconds_left(end) // 86400
 
 
-def icon(t):
-    return "🏗" if "Стро" in t else "🔬"
-
-
 # ================= HELPERS =================
 
 async def get_user(tg_id):
@@ -120,18 +117,14 @@ async def get_tasks():
         """)
 
 
-async def get_user_tasks(tg_id):
-    async with pool.acquire() as conn:
-        return await conn.fetch("SELECT * FROM tasks WHERE user_id=$1", tg_id)
+# ================= DELETE MESSAGE TIMER =================
 
-
-# ================= TIMER =================
-
-async def cleanup_tasks():
-    while True:
-        async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM tasks WHERE end_time < NOW()")
-        await asyncio.sleep(60)
+async def delete_message_later(chat_id, message_id, seconds):
+    await asyncio.sleep(seconds)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except:
+        pass
 
 
 # ================= RATING =================
@@ -179,10 +172,11 @@ async def rating_loop():
         await asyncio.sleep(14400)
 
 
-# ================= BOOST STATS =================
+# ================= BOOST STATS MESSAGE =================
 
-@dp.message(F.text == "📈 Статистика бустов")
-async def boost_stats(message: Message):
+async def send_boost_stats():
+
+    global last_boost_stats_message_id
 
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -193,64 +187,55 @@ async def boost_stats(message: Message):
         """)
 
     if not rows:
-        await message.answer("Пока никто не делал бусты")
         return
 
-    text = "📈 Статистика бустов\n\n"
+    text = "🚀 Статистика ускорений\n\n"
 
-    for i, r in enumerate(rows, start=1):
-        text += f"{i}) {r['nickname']} ускорил союзников {r['boost_count']} раз\n"
+    medals = ["🥇", "🥈", "🥉"]
 
-    await message.answer(text)
+    for i, r in enumerate(rows):
+        if i < 3:
+            emoji = medals[i]
+        else:
+            emoji = "⚡"
 
+        text += f"{emoji} {r['nickname']} — {r['boost_count']} ускорений\n"
 
-# ================= START =================
+    try:
+        if last_boost_stats_message_id:
+            await bot.delete_message(GROUP_CHAT_ID, last_boost_stats_message_id)
+    except:
+        pass
 
-@dp.message(F.text.in_({"/start", "/menu"}))
-async def start(message: Message, state: FSMContext):
-    user = await get_user(message.from_user.id)
-
-    if not user:
-        await message.answer("Введи ник:")
-        await state.set_state(Form.nickname)
-        return
-
-    await message.answer("Меню", reply_markup=main_menu())
-
-
-@dp.message(Form.nickname)
-async def reg(message: Message, state: FSMContext):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (tg_id, nickname) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-            message.from_user.id, message.text
-        )
-
-    await message.answer("Готово", reply_markup=main_menu())
-    await state.clear()
+    msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=TOPIC_ID)
+    last_boost_stats_message_id = msg.message_id
 
 
 # ================= BOOST =================
 
 @dp.message(F.text == "⚡ Буст")
 async def boost_start(message: Message, state: FSMContext):
+
+    tasks = await get_tasks()
+
+    filtered = [
+        t for t in tasks
+        if t["user_id"] != message.from_user.id
+    ]
+
     kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🏗 Стройка")],
-            [KeyboardButton(text="🔬 Исследования")]
-        ], resize_keyboard=True
+        keyboard=[[KeyboardButton(text=f"{t['nickname']}")] for t in filtered],
+        resize_keyboard=True
     )
-    await message.answer("Выбери тип", reply_markup=kb)
-    await state.set_state(Form.boost_type)
+
+    await state.update_data(filtered_tasks=filtered)
+
+    await message.answer("Кого ускоряем?", reply_markup=kb)
+    await state.set_state(Form.boost_target)
 
 
 @dp.message(Form.boost_percent)
 async def boost_apply(message: Message, state: FSMContext):
-
-    if message.text == "🔙 Назад":
-        await state.clear()
-        await message.answer("Меню", reply_markup=main_menu())
-        return
 
     percent_map = {
         "Уровень 1: 5%": 0.05,
@@ -274,11 +259,6 @@ async def boost_apply(message: Message, state: FSMContext):
                 target['id']
             )
 
-            if target_task['user_id'] == message.from_user.id:
-                await message.answer("Нельзя бустить себя")
-                await state.clear()
-                return
-
             left = seconds_left(target_task['end_time'])
             new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
 
@@ -287,7 +267,6 @@ async def boost_apply(message: Message, state: FSMContext):
                 new_time, target_task['id']
             )
 
-            # запись статистики
             await conn.execute("""
             INSERT INTO boost_stats (user_id, boost_count)
             VALUES ($1,1)
@@ -295,8 +274,26 @@ async def boost_apply(message: Message, state: FSMContext):
             DO UPDATE SET boost_count = boost_stats.boost_count + 1
             """, message.from_user.id)
 
-    await message.answer("Буст выполнен ✅")
+            user = await conn.fetchrow(
+                "SELECT nickname FROM users WHERE tg_id=$1",
+                message.from_user.id
+            )
+
+            target_user = await conn.fetchrow(
+                "SELECT nickname FROM users WHERE tg_id=$1",
+                target_task['user_id']
+            )
+
+    text = f"🔥 {user['nickname']} ускорил {target_user['nickname']} на {int(percent*100)}%"
+
+    msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=TOPIC_ID)
+
+    asyncio.create_task(delete_message_later(GROUP_CHAT_ID, msg.message_id, 43200))
+
+    await send_boost_stats()
     await send_rating()
+
+    await message.answer("Буст выполнен ✅", reply_markup=main_menu())
     await state.clear()
 
 

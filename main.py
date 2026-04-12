@@ -151,7 +151,7 @@ async def cleanup_tasks():
         await asyncio.sleep(60)
 
 
-# ================= RATING TEXT =================
+# ================= RATING =================
 
 async def generate_rating_text():
 
@@ -221,8 +221,6 @@ async def update_group_messages():
     rating_text = await generate_rating_text()
     boost_text = await generate_boost_rating()
 
-    # --- заявки ---
-
     if rating_text != last_rating_text:
 
         try:
@@ -239,8 +237,6 @@ async def update_group_messages():
 
         last_rating_message_id = msg.message_id
         last_rating_text = rating_text
-
-    # --- рейтинг бустеров ---
 
     if boost_text != last_boost_text:
 
@@ -266,10 +262,11 @@ async def rating_loop():
         await asyncio.sleep(14400)
 
 
-# ================= MENU HANDLERS =================
+# ================= HANDLERS =================
 
 @dp.message(F.text == "📋 Мои записи")
 async def my_records(message: Message):
+
     tasks = await get_user_tasks(message.from_user.id)
 
     if not tasks:
@@ -278,36 +275,49 @@ async def my_records(message: Message):
 
     text = "📋 Ваши записи:\n\n"
 
+    # ❗ ID УБРАН
     for t in tasks:
-        text += f"• ID {t['id']} — {t['action_type']} — осталось {days_left(t['end_time'])} д\n"
+        text += f"• {t['action_type']} — осталось {days_left(t['end_time'])} д\n"
 
-    await message.answer(text, reply_markup=main_menu())
-
-
-@dp.message(F.text == "📜 Список заявок")
-async def private_rating(message: Message):
-    text = await generate_rating_text()
     await message.answer(text, reply_markup=main_menu())
 
 
 @dp.message(F.text == "🗑 Удалить запись")
 async def delete_record_menu(message: Message):
+
     tasks = await get_user_tasks(message.from_user.id)
 
     if not tasks:
-        await message.answer("📭 У вас нет записей для удаления", reply_markup=main_menu())
+        await message.answer("📭 У вас нет записей", reply_markup=main_menu())
         return
 
-    text = "🗑 Ваши записи:\n\n"
-    for t in tasks:
-        text += f"• ID {t['id']} — {t['action_type']} — осталось {days_left(t['end_time'])} д\n"
+    kb = []
 
-    text += "\nФункция удаления записи пока не добавлена в этот вариант."
-    await message.answer(text, reply_markup=main_menu())
+    # максимум 2 кнопки
+    for t in tasks[:2]:
+        kb.append([KeyboardButton(text=f"{t['action_type']}")])
+
+    kb.append([KeyboardButton(text="🗑 Удалить все записи")])
+    kb.append([KeyboardButton(text="🔙 Назад")])
+
+    await message.answer(
+        "🗑 Выберите действие:",
+        reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    )
+
+
+@dp.message(F.text == "🗑 Удалить все записи")
+async def delete_all(message: Message):
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", message.from_user.id)
+
+    await message.answer("🗑 Все записи удалены", reply_markup=main_menu())
 
 
 @dp.message(F.text == "❌ Удалиться из базы")
 async def delete_from_db(message: Message, state: FSMContext):
+
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM users WHERE tg_id=$1", message.from_user.id)
 
@@ -344,278 +354,12 @@ async def reg(message: Message, state: FSMContext):
     await state.clear()
 
 
-# ================= CREATE =================
-
-@dp.message(F.text == "🛠 Создать запись")
-async def create(message: Message, state: FSMContext):
-
-    tasks = await get_user_tasks(message.from_user.id)
-
-    types = [t['action_type'] for t in tasks]
-
-    buttons = []
-
-    if not any("Стро" in t for t in types):
-        buttons.append([KeyboardButton(text="🏗 Стройка")])
-
-    if not any("Исслед" in t for t in types):
-        buttons.append([KeyboardButton(text="🔬 Исследование")])
-
-    if not buttons:
-        await message.answer("⚠️ У вас уже есть обе записи", reply_markup=main_menu())
-        return
-
-    buttons.append([KeyboardButton(text="🔙 Назад")])
-
-    await message.answer(
-        "🛠 Что создаём?",
-        reply_markup=ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-    )
-
-    await state.set_state(Form.action)
-
-
-@dp.message(Form.action)
-async def action(message: Message, state: FSMContext):
-
-    if message.text == "🔙 Назад":
-        await state.clear()
-        await message.answer("📋 Главное меню", reply_markup=main_menu())
-        return
-
-    await state.update_data(action=message.text)
-
-    await message.answer("📅 Сколько дней?", reply_markup=back_kb())
-
-    await state.set_state(Form.days)
-
-
-@dp.message(Form.days)
-async def days(message: Message, state: FSMContext):
-
-    if message.text == "🔙 Назад":
-        await create(message, state)
-        return
-
-    if not message.text.isdigit():
-        await message.answer("⚠️ Введите число")
-        return
-
-    data = await state.get_data()
-
-    end = datetime.utcnow() + timedelta(days=int(message.text))
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-        INSERT INTO tasks (user_id,action_type,end_time)
-        VALUES ($1,$2,$3)
-        """, message.from_user.id, data["action"], end)
-
-    await message.answer("✅ Запись создана", reply_markup=main_menu())
-
-    await update_group_messages()
-
-    await state.clear()
-
-
-# ================= BOOST =================
-
-@dp.message(F.text == "⚡ Буст")
-async def boost_start(message: Message, state: FSMContext):
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🏗 Стройка")],
-            [KeyboardButton(text="🔬 Исследование")],
-            [KeyboardButton(text="🔙 Назад")]
-        ],
-        resize_keyboard=True
-    )
-
-    await message.answer("⚡ Выберите тип", reply_markup=kb)
-
-    await state.set_state(Form.boost_type)
-
-
-@dp.message(Form.boost_type)
-async def boost_type(message: Message, state: FSMContext):
-
-    if message.text == "🔙 Назад":
-        await state.clear()
-        await message.answer("📋 Главное меню", reply_markup=main_menu())
-        return
-
-    tasks = await get_tasks()
-
-    filtered = [
-        t for t in tasks
-        if message.from_user.id != t["user_id"]
-        and (("Стро" in message.text and "Стро" in t["action_type"])
-             or ("Исслед" in message.text and "Исслед" in t["action_type"]))
-    ]
-
-    if not filtered:
-        await message.answer("⚠️ Нет доступных целей", reply_markup=main_menu())
-        await state.clear()
-        return
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t['nickname'])] for t in filtered] +
-        [[KeyboardButton(text="🔙 Назад")]],
-        resize_keyboard=True
-    )
-
-    await state.update_data(filtered_tasks=filtered)
-
-    await message.answer("🎯 Выберите цель", reply_markup=kb)
-
-    await state.set_state(Form.boost_target)
-
-
-@dp.message(Form.boost_target)
-async def boost_target(message: Message, state: FSMContext):
-
-    if message.text == "🔙 Назад":
-        data = await state.get_data()
-
-        filtered = data.get("filtered_tasks", [])
-
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=t['nickname'])] for t in filtered] +
-            [[KeyboardButton(text="🔙 Назад")]],
-            resize_keyboard=True
-        )
-
-        await message.answer("⚡ Выберите тип", reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🏗 Стройка")],
-                [KeyboardButton(text="🔬 Исследование")],
-                [KeyboardButton(text="🔙 Назад")]
-            ],
-            resize_keyboard=True
-        ))
-
-        await state.set_state(Form.boost_type)
-        return
-
-    data = await state.get_data()
-
-    target = None
-
-    for t in data['filtered_tasks']:
-        if t['nickname'] == message.text:
-            target = t
-
-    if not target:
-        return
-
-    await state.update_data(target=target)
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🥉 5%")],
-            [KeyboardButton(text="🥈 10%")],
-            [KeyboardButton(text="🥇 15%")],
-            [KeyboardButton(text="🔙 Назад")]
-        ],
-        resize_keyboard=True
-    )
-
-    await message.answer("⚡ Уровень буста", reply_markup=kb)
-
-    await state.set_state(Form.boost_percent)
-
-
-@dp.message(Form.boost_percent)
-async def boost_apply(message: Message, state: FSMContext):
-
-    if message.text == "🔙 Назад":
-        data = await state.get_data()
-
-        target = data.get("target")
-        filtered = data.get("filtered_tasks", [])
-
-        kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=t['nickname'])] for t in filtered] +
-            [[KeyboardButton(text="🔙 Назад")]],
-            resize_keyboard=True
-        )
-
-        await message.answer("🎯 Выберите цель", reply_markup=kb)
-        await state.set_state(Form.boost_target)
-        return
-
-    percent_map = {
-        "🥉 5%": 0.05,
-        "🥈 10%": 0.10,
-        "🥇 15%": 0.15
-    }
-
-    if message.text not in percent_map:
-        return
-
-    percent = percent_map[message.text]
-
-    data = await state.get_data()
-    target = data["target"]
-
-    async with pool.acquire() as conn:
-
-        async with conn.transaction():
-
-            target_task = await conn.fetchrow("""
-            SELECT * FROM tasks WHERE id=$1 FOR UPDATE
-            """, target["id"])
-
-            left = seconds_left(target_task["end_time"])
-
-            new_time = datetime.utcnow() + timedelta(seconds=left * (1 - percent))
-
-            await conn.execute("""
-            UPDATE tasks SET end_time=$1 WHERE id=$2
-            """, new_time, target_task["id"])
-
-            await conn.execute("""
-            INSERT INTO boosts (booster_id,target_id)
-            VALUES ($1,$2)
-            """, message.from_user.id, target_task["user_id"])
-
-            user = await conn.fetchrow("SELECT nickname FROM users WHERE tg_id=$1", message.from_user.id)
-            target_user = await conn.fetchrow("SELECT nickname FROM users WHERE tg_id=$1", target_task["user_id"])
-
-    msg = await bot.send_message(
-        GROUP_CHAT_ID,
-        f"🔥 {user['nickname']} ускорил прогресс для {target_user['nickname']} на {int(percent*100)}%",
-        message_thread_id=TOPIC_ID
-    )
-
-    asyncio.create_task(delete_later(msg.chat.id, msg.message_id, 43200))
-
-    await message.answer("✅ Буст применён", reply_markup=main_menu())
-
-    await update_group_messages()
-
-    await state.clear()
-
-
-async def delete_later(chat_id, msg_id, delay):
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id, msg_id)
-    except:
-        pass
-
-
 # ================= RUN =================
 
 async def main():
     await init_db()
-
     asyncio.create_task(cleanup_tasks())
     asyncio.create_task(rating_loop())
-
-    await update_group_messages()
-
     await dp.start_polling(bot)
 
 

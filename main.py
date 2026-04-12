@@ -197,11 +197,14 @@ async def generate_boost_rating():
     text = "🏆 Топ бустеров\n\n"
 
     if not rows:
-        text += "пока нет бустов"
+        text += "😴 пока нет бустов"
         return text
 
+    medals = ["🥇", "🥈", "🥉"]
+
     for i, r in enumerate(rows, start=1):
-        text += f"{i}) {r['nickname']} — {r['boosts']} бустов\n"
+        medal = medals[i - 1] if i <= 3 else "🔹"
+        text += f"{medal} {i}) {r['nickname']} — ⚡ {r['boosts']} бустов\n"
 
     return text
 
@@ -261,6 +264,55 @@ async def rating_loop():
     while True:
         await update_group_messages()
         await asyncio.sleep(14400)
+
+
+# ================= MENU HANDLERS =================
+
+@dp.message(F.text == "📋 Мои записи")
+async def my_records(message: Message):
+    tasks = await get_user_tasks(message.from_user.id)
+
+    if not tasks:
+        await message.answer("📭 У вас пока нет записей", reply_markup=main_menu())
+        return
+
+    text = "📋 Ваши записи:\n\n"
+
+    for t in tasks:
+        text += f"• ID {t['id']} — {t['action_type']} — осталось {days_left(t['end_time'])} д\n"
+
+    await message.answer(text, reply_markup=main_menu())
+
+
+@dp.message(F.text == "📜 Список заявок")
+async def private_rating(message: Message):
+    text = await generate_rating_text()
+    await message.answer(text, reply_markup=main_menu())
+
+
+@dp.message(F.text == "🗑 Удалить запись")
+async def delete_record_menu(message: Message):
+    tasks = await get_user_tasks(message.from_user.id)
+
+    if not tasks:
+        await message.answer("📭 У вас нет записей для удаления", reply_markup=main_menu())
+        return
+
+    text = "🗑 Ваши записи:\n\n"
+    for t in tasks:
+        text += f"• ID {t['id']} — {t['action_type']} — осталось {days_left(t['end_time'])} д\n"
+
+    text += "\nФункция удаления записи пока не добавлена в этот вариант."
+    await message.answer(text, reply_markup=main_menu())
+
+
+@dp.message(F.text == "❌ Удалиться из базы")
+async def delete_from_db(message: Message, state: FSMContext):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE tg_id=$1", message.from_user.id)
+
+    await state.clear()
+    await message.answer("❌ Вы удалены из базы", reply_markup=main_menu())
 
 
 # ================= START =================
@@ -424,7 +476,26 @@ async def boost_type(message: Message, state: FSMContext):
 async def boost_target(message: Message, state: FSMContext):
 
     if message.text == "🔙 Назад":
-        await boost_start(message, state)
+        data = await state.get_data()
+
+        filtered = data.get("filtered_tasks", [])
+
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=t['nickname'])] for t in filtered] +
+            [[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
+
+        await message.answer("⚡ Выберите тип", reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="🏗 Стройка")],
+                [KeyboardButton(text="🔬 Исследование")],
+                [KeyboardButton(text="🔙 Назад")]
+            ],
+            resize_keyboard=True
+        ))
+
+        await state.set_state(Form.boost_type)
         return
 
     data = await state.get_data()
@@ -459,6 +530,18 @@ async def boost_target(message: Message, state: FSMContext):
 async def boost_apply(message: Message, state: FSMContext):
 
     if message.text == "🔙 Назад":
+        data = await state.get_data()
+
+        target = data.get("target")
+        filtered = data.get("filtered_tasks", [])
+
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=t['nickname'])] for t in filtered] +
+            [[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
+
+        await message.answer("🎯 Выберите цель", reply_markup=kb)
         await state.set_state(Form.boost_target)
         return
 
@@ -530,6 +613,8 @@ async def main():
 
     asyncio.create_task(cleanup_tasks())
     asyncio.create_task(rating_loop())
+
+    await update_group_messages()
 
     await dp.start_polling(bot)
 

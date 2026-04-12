@@ -33,6 +33,9 @@ pool = None
 last_rating_message_id = None
 last_boost_rating_message_id = None
 
+last_rating_text = None
+last_boost_text = None
+
 
 # ================= DATABASE =================
 
@@ -209,37 +212,49 @@ async def update_group_messages():
 
     global last_rating_message_id
     global last_boost_rating_message_id
+    global last_rating_text
+    global last_boost_text
 
     rating_text = await generate_rating_text()
     boost_text = await generate_boost_rating()
 
-    try:
-        if last_rating_message_id:
-            await bot.delete_message(GROUP_CHAT_ID, last_rating_message_id)
-    except:
-        pass
+    # --- заявки ---
 
-    msg = await bot.send_message(
-        GROUP_CHAT_ID,
-        rating_text,
-        message_thread_id=TOPIC_ID
-    )
+    if rating_text != last_rating_text:
 
-    last_rating_message_id = msg.message_id
+        try:
+            if last_rating_message_id:
+                await bot.delete_message(GROUP_CHAT_ID, last_rating_message_id)
+        except:
+            pass
 
-    try:
-        if last_boost_rating_message_id:
-            await bot.delete_message(GROUP_CHAT_ID, last_boost_rating_message_id)
-    except:
-        pass
+        msg = await bot.send_message(
+            GROUP_CHAT_ID,
+            rating_text,
+            message_thread_id=TOPIC_ID
+        )
 
-    msg2 = await bot.send_message(
-        GROUP_CHAT_ID,
-        boost_text,
-        message_thread_id=TOPIC_ID
-    )
+        last_rating_message_id = msg.message_id
+        last_rating_text = rating_text
 
-    last_boost_rating_message_id = msg2.message_id
+    # --- рейтинг бустеров ---
+
+    if boost_text != last_boost_text:
+
+        try:
+            if last_boost_rating_message_id:
+                await bot.delete_message(GROUP_CHAT_ID, last_boost_rating_message_id)
+        except:
+            pass
+
+        msg2 = await bot.send_message(
+            GROUP_CHAT_ID,
+            boost_text,
+            message_thread_id=TOPIC_ID
+        )
+
+        last_boost_rating_message_id = msg2.message_id
+        last_boost_text = boost_text
 
 
 async def rating_loop():

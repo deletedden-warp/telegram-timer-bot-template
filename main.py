@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -120,7 +120,7 @@ async def get_tasks():
         return await conn.fetch("""
         SELECT t.*, u.nickname
         FROM tasks t JOIN users u ON u.tg_id=t.user_id
-        ORDER BY end_time DESC
+        ORDER BY t.end_time DESC
         """)
 
 async def get_user_tasks(tg_id):
@@ -159,10 +159,12 @@ async def cleanup_tasks():
             await conn.execute("DELETE FROM tasks WHERE end_time < NOW()")
         await asyncio.sleep(60)
 
-async def cleanup_boost_messages():
-    while True:
-        await asyncio.sleep(43200)  # 12 часов
-        # Сообщения удаляются через 12 часов, реализация ниже
+async def delete_message_after_delay(chat_id, message_id, delay):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except:
+        pass
 
 # ================= RATING =================
 
@@ -304,7 +306,6 @@ async def days(message: Message, state: FSMContext):
 
     data = await state.get_data()
     
-    # Проверяем, нет ли уже такой записи
     existing = await get_task_by_type(message.from_user.id, data["action"])
     if existing:
         await message.answer(f"⚠️ **У тебя уже есть запись типа {data['action']}!**\n\nСначала удали её или дождись завершения.", parse_mode="Markdown", reply_markup=main_menu())
@@ -462,6 +463,7 @@ async def delete_user_confirm(message: Message, state: FSMContext):
         async with pool.acquire() as conn:
             await conn.execute("DELETE FROM tasks WHERE user_id=$1", message.from_user.id)
             await conn.execute("DELETE FROM users WHERE tg_id=$1", message.from_user.id)
+            await conn.execute("DELETE FROM boosts WHERE booster_id=$1 OR target_id=$1", message.from_user.id)
 
         await message.answer("🗑 **Ты удалён из базы.**\n\nВведи /start для регистрации", parse_mode="Markdown")
         await state.set_state(Form.nickname)
@@ -497,7 +499,6 @@ async def boost_type(message: Message, state: FSMContext):
 
     filtered = [t for t in tasks if ("Стро" in message.text and "Стро" in t["action_type"]) or ("Исслед" in message.text and "Исслед" in t["action_type"])]
     
-    # Убираем пользователя из списка
     filtered = [t for t in filtered if t['user_id'] != message.from_user.id]
 
     if not filtered:
@@ -510,7 +511,7 @@ async def boost_type(message: Message, state: FSMContext):
         resize_keyboard=True
     )
 
-    await state.update_data(filtered_tasks=filtered)
+    await state.update_data(filtered_tasks=filtered, boost_type=message.text)
     await message.answer("🎯 **Выбери цель для буста:**", parse_mode="Markdown", reply_markup=kb)
     await state.set_state(Form.boost_target)
 
@@ -522,9 +523,10 @@ async def boost_target(message: Message, state: FSMContext):
         return
         
     data = await state.get_data()
+    filtered_tasks = data.get('filtered_tasks', [])
     target = None
     
-    for t in data['filtered_tasks']:
+    for t in filtered_tasks:
         if t['nickname'] == message.text:
             target = t
             break
@@ -533,7 +535,7 @@ async def boost_target(message: Message, state: FSMContext):
         await message.answer("❌ **Выбери пользователя из списка!**", parse_mode="Markdown")
         return
         
-    await state.update_data(target=target)
+    await state.update_data(target_id=target['id'], target_nickname=target['nickname'], target_user_id=target['user_id'])
 
     kb = ReplyKeyboardMarkup(
         keyboard=[
@@ -565,14 +567,28 @@ async def boost_apply(message: Message, state: FSMContext):
 
     percent = percent_map[message.text]
     data = await state.get_data()
-    target = data['target']
+    
+    target_id = data.get('target_id')
+    target_nickname = data.get('target_nickname')
+    target_user_id = data.get('target_user_id')
+    boost_type = data.get('boost_type')
+    
+    if not target_id:
+        await message.answer("❌ **Ошибка: цель не выбрана. Начни заново.**", parse_mode="Markdown")
+        await state.clear()
+        return
 
     async with pool.acquire() as conn:
         async with conn.transaction():
             target_task = await conn.fetchrow(
                 "SELECT * FROM tasks WHERE id=$1 FOR UPDATE",
-                target['id']
+                target_id
             )
+            
+            if not target_task:
+                await message.answer("❌ **Запись уже удалена!**", parse_mode="Markdown")
+                await state.clear()
+                return
 
             left = seconds_left(target_task['end_time'])
             new_time = datetime.utcnow() + timedelta(seconds=int(left * (1 - percent/100)))
@@ -582,7 +598,6 @@ async def boost_apply(message: Message, state: FSMContext):
                 new_time, target_task['id']
             )
 
-            # Бустим свою аналогичную задачу
             self_task = await conn.fetchrow(
                 "SELECT * FROM tasks WHERE user_id=$1 AND action_type=$2",
                 message.from_user.id,
@@ -598,37 +613,23 @@ async def boost_apply(message: Message, state: FSMContext):
                     new2, self_task['id']
                 )
 
-            # Логируем буст
-            await log_boost(message.from_user.id, target['user_id'], target_task['action_type'], percent)
+            await log_boost(message.from_user.id, target_user_id, target_task['action_type'], percent)
 
             user = await conn.fetchrow(
                 "SELECT nickname FROM users WHERE tg_id=$1",
                 message.from_user.id
             )
-            target_user = await conn.fetchrow(
-                "SELECT nickname FROM users WHERE tg_id=$1",
-                target_task['user_id']
-            )
 
-    # Отправляем сообщение в группу
     if "Стро" in target_task['action_type']:
-        text = f"🔥 **Буст!** {user['nickname']} ускорил стройку для {target_user['nickname']} на {percent}%"
+        text = f"🔥 **Буст!** {user['nickname']} ускорил стройку для {target_nickname} на {percent}%"
     else:
-        text = f"🔥 **Буст!** {user['nickname']} ускорил исследование для {target_user['nickname']} на {percent}%"
+        text = f"🔥 **Буст!** {user['nickname']} ускорил исследование для {target_nickname} на {percent}%"
 
     boost_msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=TOPIC_ID, parse_mode="Markdown")
     
-    # Удаляем сообщение через 12 часов
-    async def delete_after_delay(msg_id, chat_id, delay):
-        await asyncio.sleep(delay)
-        try:
-            await bot.delete_message(chat_id, msg_id)
-        except:
-            pass
-    
-    asyncio.create_task(delete_after_delay(boost_msg.message_id, GROUP_CHAT_ID, 43200))
+    asyncio.create_task(delete_message_after_delay(GROUP_CHAT_ID, boost_msg.message_id, 43200))
 
-    await message.answer(f"✅ **Буст выполнен!** {user['nickname']} +{percent}% к скорости", parse_mode="Markdown")
+    await message.answer(f"✅ **Буст выполнен!** Ты ускорил {target_nickname} на {percent}% и получил такое же ускорение себе!", parse_mode="Markdown")
     await send_rating_to_group()
     await send_boost_rating_to_group()
     await state.clear()

@@ -38,6 +38,9 @@ async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with pool.acquire() as conn:
+        # Удаляем старую таблицу boosts если она существует с неправильной структурой
+        await conn.execute("DROP TABLE IF EXISTS boosts CASCADE;")
+        
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             tg_id BIGINT PRIMARY KEY,

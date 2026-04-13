@@ -134,6 +134,10 @@ async def get_task_by_type(tg_id, task_type):
             tg_id, task_type
         )
 
+async def get_task_by_id(task_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("SELECT * FROM tasks WHERE id=$1", task_id)
+
 async def log_boost(booster_id, target_id, boost_type, boost_percent):
     async with pool.acquire() as conn:
         await conn.execute(
@@ -228,7 +232,7 @@ async def rating_loop():
     while True:
         await send_rating_to_group()
         await send_boost_rating_to_group()
-        await asyncio.sleep(14400)  # 4 часа
+        await asyncio.sleep(14400)
 
 # ================= START =================
 
@@ -483,155 +487,205 @@ async def boost_start(message: Message, state: FSMContext):
             [KeyboardButton(text="🏗 Стройка")],
             [KeyboardButton(text="🔬 Исследования")],
             [KeyboardButton(text="🔙 Назад")]
-        ], resize_keyboard=True
+        ], 
+        resize_keyboard=True
     )
     await message.answer("⚡️ **Выбери тип для буста:**", parse_mode="Markdown", reply_markup=kb)
     await state.set_state(Form.boost_type)
 
 @dp.message(Form.boost_type)
-async def boost_type(message: Message, state: FSMContext):
+async def boost_type_handler(message: Message, state: FSMContext):
     if message.text == "🔙 Назад":
         await state.clear()
         await message.answer("🏠 **Главное меню**", parse_mode="Markdown", reply_markup=main_menu())
         return
-        
-    tasks = await get_tasks()
-
-    filtered = [t for t in tasks if ("Стро" in message.text and "Стро" in t["action_type"]) or ("Исслед" in message.text and "Исслед" in t["action_type"])]
     
-    filtered = [t for t in filtered if t['user_id'] != message.from_user.id]
-
+    # Сохраняем выбранный тип буста
+    boost_type = message.text
+    await state.update_data(boost_type=boost_type)
+    
+    # Получаем все задачи
+    tasks = await get_tasks()
+    
+    # Фильтруем по типу и исключаем себя
+    filtered = []
+    for t in tasks:
+        if boost_type == "🏗 Стройка" and "Стро" in t["action_type"]:
+            if t['user_id'] != message.from_user.id:
+                filtered.append(t)
+        elif boost_type == "🔬 Исследования" and "Исслед" in t["action_type"]:
+            if t['user_id'] != message.from_user.id:
+                filtered.append(t)
+    
     if not filtered:
         await message.answer("❌ **Нет доступных пользователей для буста**", parse_mode="Markdown", reply_markup=main_menu())
         await state.clear()
         return
-
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=f"{t['nickname']}")] for t in filtered] + [[KeyboardButton(text="🔙 Назад")]],
-        resize_keyboard=True
-    )
-
-    await state.update_data(filtered_tasks=filtered, boost_type=message.text)
+    
+    # Сохраняем список пользователей
+    await state.update_data(filtered_users=filtered)
+    
+    # Создаем клавиатуру с никами
+    buttons = []
+    for user in filtered:
+        buttons.append([KeyboardButton(text=user['nickname'])])
+    buttons.append([KeyboardButton(text="🔙 Назад")])
+    
+    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
     await message.answer("🎯 **Выбери цель для буста:**", parse_mode="Markdown", reply_markup=kb)
     await state.set_state(Form.boost_target)
 
 @dp.message(Form.boost_target)
-async def boost_target(message: Message, state: FSMContext):
+async def boost_target_handler(message: Message, state: FSMContext):
     if message.text == "🔙 Назад":
         await state.clear()
         await message.answer("🏠 **Главное меню**", parse_mode="Markdown", reply_markup=main_menu())
         return
-        
-    data = await state.get_data()
-    filtered_tasks = data.get('filtered_tasks', [])
-    target = None
     
-    for t in filtered_tasks:
-        if t['nickname'] == message.text:
-            target = t
+    data = await state.get_data()
+    filtered_users = data.get('filtered_users', [])
+    
+    # Ищем выбранного пользователя
+    selected_user = None
+    for user in filtered_users:
+        if user['nickname'] == message.text:
+            selected_user = user
             break
     
-    if not target:
+    if not selected_user:
         await message.answer("❌ **Выбери пользователя из списка!**", parse_mode="Markdown")
         return
-        
-    await state.update_data(target_id=target['id'], target_nickname=target['nickname'], target_user_id=target['user_id'])
-
+    
+    # Сохраняем данные о цели
+    await state.update_data(
+        target_task_id=selected_user['id'],
+        target_user_id=selected_user['user_id'],
+        target_nickname=selected_user['nickname'],
+        target_action_type=selected_user['action_type']
+    )
+    
+    # Клавиатура с уровнями буста
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔥 Уровень 1: 5%")],
             [KeyboardButton(text="⚡️ Уровень 2: 10%")],
             [KeyboardButton(text="💪 Уровень 3: 15%")],
             [KeyboardButton(text="🔙 Назад")]
-        ], resize_keyboard=True
+        ], 
+        resize_keyboard=True
     )
     await message.answer("📈 **Выбери уровень буста:**", parse_mode="Markdown", reply_markup=kb)
     await state.set_state(Form.boost_percent)
 
 @dp.message(Form.boost_percent)
-async def boost_apply(message: Message, state: FSMContext):
+async def boost_apply_handler(message: Message, state: FSMContext):
     if message.text == "🔙 Назад":
         await state.clear()
         await message.answer("🏠 **Главное меню**", parse_mode="Markdown", reply_markup=main_menu())
         return
-
+    
+    # Определяем процент буста
     percent_map = {
         "🔥 Уровень 1: 5%": 5,
         "⚡️ Уровень 2: 10%": 10,
         "💪 Уровень 3: 15%": 15
     }
-
+    
     if message.text not in percent_map:
         await message.answer("❌ **Выбери уровень из списка!**", parse_mode="Markdown")
         return
-
+    
     percent = percent_map[message.text]
     data = await state.get_data()
     
-    target_id = data.get('target_id')
-    target_nickname = data.get('target_nickname')
+    # Получаем сохраненные данные
+    target_task_id = data.get('target_task_id')
     target_user_id = data.get('target_user_id')
+    target_nickname = data.get('target_nickname')
+    target_action_type = data.get('target_action_type')
     boost_type = data.get('boost_type')
     
-    if not target_id:
-        await message.answer("❌ **Ошибка: цель не выбрана. Начни заново.**", parse_mode="Markdown")
+    if not target_task_id:
+        await message.answer("❌ **Ошибка! Начни процесс буста заново.**", parse_mode="Markdown")
         await state.clear()
         return
-
+    
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Получаем задачу цели
             target_task = await conn.fetchrow(
                 "SELECT * FROM tasks WHERE id=$1 FOR UPDATE",
-                target_id
+                target_task_id
             )
             
             if not target_task:
                 await message.answer("❌ **Запись уже удалена!**", parse_mode="Markdown")
                 await state.clear()
                 return
-
-            left = seconds_left(target_task['end_time'])
-            new_time = datetime.utcnow() + timedelta(seconds=int(left * (1 - percent/100)))
-
+            
+            # Рассчитываем новое время для цели
+            current_end = target_task['end_time']
+            left_seconds = seconds_left(current_end)
+            new_seconds = int(left_seconds * (1 - percent / 100))
+            new_end_time = datetime.utcnow() + timedelta(seconds=new_seconds)
+            
+            # Обновляем задачу цели
             await conn.execute(
                 "UPDATE tasks SET end_time=$1 WHERE id=$2",
-                new_time, target_task['id']
+                new_end_time, target_task_id
             )
-
+            
+            # Находим и обновляем свою задачу того же типа
             self_task = await conn.fetchrow(
                 "SELECT * FROM tasks WHERE user_id=$1 AND action_type=$2",
-                message.from_user.id,
-                target_task['action_type']
+                message.from_user.id, target_action_type
             )
-
+            
             if self_task:
-                left2 = seconds_left(self_task['end_time'])
-                new2 = datetime.utcnow() + timedelta(seconds=int(left2 * (1 - percent/100)))
-
+                self_left_seconds = seconds_left(self_task['end_time'])
+                self_new_seconds = int(self_left_seconds * (1 - percent / 100))
+                self_new_end_time = datetime.utcnow() + timedelta(seconds=self_new_seconds)
+                
                 await conn.execute(
                     "UPDATE tasks SET end_time=$1 WHERE id=$2",
-                    new2, self_task['id']
+                    self_new_end_time, self_task['id']
                 )
-
-            await log_boost(message.from_user.id, target_user_id, target_task['action_type'], percent)
-
-            user = await conn.fetchrow(
+            
+            # Логируем буст
+            await log_boost(message.from_user.id, target_user_id, target_action_type, percent)
+            
+            # Получаем ник бустера
+            booster = await conn.fetchrow(
                 "SELECT nickname FROM users WHERE tg_id=$1",
                 message.from_user.id
             )
-
-    if "Стро" in target_task['action_type']:
-        text = f"🔥 **Буст!** {user['nickname']} ускорил стройку для {target_nickname} на {percent}%"
-    else:
-        text = f"🔥 **Буст!** {user['nickname']} ускорил исследование для {target_nickname} на {percent}%"
-
-    boost_msg = await bot.send_message(GROUP_CHAT_ID, text, message_thread_id=TOPIC_ID, parse_mode="Markdown")
     
+    # Отправляем сообщение в группу
+    boost_text = f"🔥 **Буст!** {booster['nickname']} ускорил "
+    if "Стро" in target_action_type:
+        boost_text += f"стройку для {target_nickname} на {percent}%"
+    else:
+        boost_text += f"исследование для {target_nickname} на {percent}%"
+    
+    boost_msg = await bot.send_message(GROUP_CHAT_ID, boost_text, message_thread_id=TOPIC_ID, parse_mode="Markdown")
+    
+    # Удаляем сообщение через 12 часов
     asyncio.create_task(delete_message_after_delay(GROUP_CHAT_ID, boost_msg.message_id, 43200))
-
-    await message.answer(f"✅ **Буст выполнен!** Ты ускорил {target_nickname} на {percent}% и получил такое же ускорение себе!", parse_mode="Markdown")
+    
+    # Ответ пользователю
+    await message.answer(
+        f"✅ **Буст выполнен!**\n\n"
+        f"📊 Ты ускорил {target_nickname} на {percent}%\n"
+        f"⚡️ Твоя задача тоже ускорена на {percent}%",
+        parse_mode="Markdown", 
+        reply_markup=main_menu()
+    )
+    
+    # Обновляем рейтинги
     await send_rating_to_group()
     await send_boost_rating_to_group()
+    
+    # Очищаем состояние
     await state.clear()
 
 # ================= RUN =================

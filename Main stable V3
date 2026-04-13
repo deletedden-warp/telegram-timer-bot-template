@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
@@ -109,10 +109,32 @@ def back_kb():
     )
 
 
+def action_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Стройка")],
+            [KeyboardButton(text="Исследования")],
+            [KeyboardButton(text="🔙 Назад")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def boost_type_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="💪 Силовой буст")],
+            [KeyboardButton(text="🔬 Исследовательский буст")],
+            [KeyboardButton(text="🔙 Назад")]
+        ],
+        resize_keyboard=True
+    )
+
+
 # ================= HELPERS =================
 
 def seconds_left(end):
-    return max(0, int((end - datetime.utcnow()).total_seconds()))
+    return max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
 
 
 def days_left(end):
@@ -124,8 +146,12 @@ def icon(t):
 
 
 async def get_user(tg_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
+    try:
+        async with pool.acquire() as conn:
+            return await conn.fetchrow("SELECT * FROM users WHERE tg_id=$1", tg_id)
+    except Exception as e:
+        logging.error(f"DB error in get_user: {e}")
+        return None
 
 
 async def get_tasks():
@@ -275,15 +301,199 @@ async def my_records(message: Message):
 
     text = "📋 Ваши записи:\n\n"
 
-    # ❗ ID УБРАН
     for t in tasks:
         text += f"• {t['action_type']} — осталось {days_left(t['end_time'])} д\n"
 
     await message.answer(text, reply_markup=main_menu())
 
 
+@dp.message(F.text == "📜 Список заявок")
+async def show_tasks_list(message: Message):
+    text = await generate_rating_text()
+    await message.answer(text, reply_markup=main_menu())
+
+
+@dp.message(F.text == "🛠 Создать запись")
+async def create_record(message: Message, state: FSMContext):
+    await message.answer("Выберите тип:", reply_markup=action_kb())
+    await state.set_state(Form.action)
+
+
+@dp.message(Form.action)
+async def process_action_type(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await state.clear()
+        await message.answer("📋 Главное меню", reply_markup=main_menu())
+        return
+    
+    if message.text not in ["Стройка", "Исследования"]:
+        await message.answer("Пожалуйста, выберите тип из кнопок ниже", reply_markup=action_kb())
+        return
+    
+    await state.update_data(action_type=message.text)
+    await message.answer("Введите количество дней:", reply_markup=back_kb())
+    await state.set_state(Form.days)
+
+
+@dp.message(Form.days)
+async def process_days(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await state.clear()
+        await message.answer("📋 Главное меню", reply_markup=main_menu())
+        return
+    
+    try:
+        days = int(message.text)
+        if days <= 0:
+            await message.answer("Пожалуйста, введите положительное число дней")
+            return
+        
+        user_data = await state.get_data()
+        action_type = user_data.get('action_type')
+        
+        end_time = datetime.now(timezone.utc) + timedelta(days=days)
+        
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO tasks (user_id, action_type, end_time)
+                VALUES ($1, $2, $3)
+            """, message.from_user.id, action_type, end_time)
+        
+        await message.answer(f"✅ Запись создана!\nТип: {action_type}\nДней: {days}\nДата окончания: {end_time.strftime('%d.%m.%Y')}", reply_markup=main_menu())
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("Пожалуйста, введите число", reply_markup=back_kb())
+
+
+@dp.message(F.text == "⚡ Буст")
+async def start_boost(message: Message, state: FSMContext):
+    user = await get_user(message.from_user.id)
+    if not user:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start", reply_markup=main_menu())
+        return
+    
+    await message.answer("Выберите тип буста:", reply_markup=boost_type_kb())
+    await state.set_state(Form.boost_type)
+
+
+@dp.message(Form.boost_type)
+async def process_boost_type(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await state.clear()
+        await message.answer("📋 Главное меню", reply_markup=main_menu())
+        return
+    
+    if message.text not in ["💪 Силовой буст", "🔬 Исследовательский буст"]:
+        await message.answer("Пожалуйста, выберите тип буста из кнопок ниже", reply_markup=boost_type_kb())
+        return
+    
+    await state.update_data(boost_type=message.text)
+    
+    # Получаем список пользователей для выбора цели
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT tg_id, nickname FROM users WHERE tg_id != $1", message.from_user.id)
+    
+    if not users:
+        await message.answer("❌ Нет других пользователей для буста", reply_markup=main_menu())
+        await state.clear()
+        return
+    
+    kb = []
+    for user in users[:10]:  # Ограничим 10 пользователями
+        kb.append([KeyboardButton(text=f"{user['nickname']}")])
+    kb.append([KeyboardButton(text="🔙 Назад")])
+    
+    await message.answer("Выберите цель для буста:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    await state.set_state(Form.boost_target)
+
+
+@dp.message(Form.boost_target)
+async def process_boost_target(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("Выберите тип буста:", reply_markup=boost_type_kb())
+        await state.set_state(Form.boost_type)
+        return
+    
+    # Ищем пользователя по нику
+    async with pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT tg_id, nickname FROM users WHERE nickname = $1", message.text)
+    
+    if not target:
+        await message.answer("❌ Пользователь не найден. Выберите из списка:", reply_markup=back_kb())
+        return
+    
+    await state.update_data(boost_target=target['tg_id'], boost_target_name=target['nickname'])
+    await message.answer("Введите процент буста (1-100):", reply_markup=back_kb())
+    await state.set_state(Form.boost_percent)
+
+
+@dp.message(Form.boost_percent)
+async def process_boost_percent(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        user_data = await state.get_data()
+        # Возвращаем к выбору цели
+        async with pool.acquire() as conn:
+            users = await conn.fetch("SELECT tg_id, nickname FROM users WHERE tg_id != $1", message.from_user.id)
+        
+        kb = []
+        for user in users[:10]:
+            kb.append([KeyboardButton(text=f"{user['nickname']}")])
+        kb.append([KeyboardButton(text="🔙 Назад"])
+        
+        await message.answer("Выберите цель для буста:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+        await state.set_state(Form.boost_target)
+        return
+    
+    try:
+        percent = int(message.text)
+        if percent < 1 or percent > 100:
+            await message.answer("Пожалуйста, введите число от 1 до 100", reply_markup=back_kb())
+            return
+        
+        user_data = await state.get_data()
+        boost_type = user_data.get('boost_type')
+        target_id = user_data.get('boost_target')
+        target_name = user_data.get('boost_target_name')
+        
+        # Сохраняем буст в базу
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO boosts (booster_id, target_id)
+                VALUES ($1, $2)
+            """, message.from_user.id, target_id)
+        
+        # Получаем ник бустера
+        booster = await get_user(message.from_user.id)
+        
+        await message.answer(f"✅ Буст создан!\n"
+                           f"Тип: {boost_type}\n"
+                           f"Цель: {target_name}\n"
+                           f"Процент: {percent}%\n"
+                           f"Бустер: {booster['nickname']}", 
+                           reply_markup=main_menu())
+        
+        # Отправляем уведомление в группу
+        await bot.send_message(
+            GROUP_CHAT_ID,
+            f"⚡ БУСТ!\n{booster['nickname']} бустит {target_name} на {percent}%!\nТип: {boost_type}",
+            message_thread_id=TOPIC_ID
+        )
+        
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("Пожалуйста, введите число", reply_markup=back_kb())
+
+
+@dp.message(F.text == "🏆 Рейтинг бустов")
+async def show_boost_rating(message: Message):
+    text = await generate_boost_rating()
+    await message.answer(text, reply_markup=main_menu())
+
+
 @dp.message(F.text == "🗑 Удалить запись")
-async def delete_record_menu(message: Message):
+async def delete_record_menu(message: Message, state: FSMContext):
 
     tasks = await get_user_tasks(message.from_user.id)
 
@@ -292,37 +502,89 @@ async def delete_record_menu(message: Message):
         return
 
     kb = []
-
-    # максимум 2 кнопки
-    for t in tasks[:2]:
-        kb.append([KeyboardButton(text=f"{t['action_type']}")])
+    
+    # Показываем до 5 записей для удаления
+    for t in tasks[:5]:
+        kb.append([KeyboardButton(text=f"{t['action_type']} (id:{t['id']})")])
 
     kb.append([KeyboardButton(text="🗑 Удалить все записи")])
     kb.append([KeyboardButton(text="🔙 Назад")])
 
     await message.answer(
-        "🗑 Выберите действие:",
+        "🗑 Выберите запись для удаления:",
         reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
     )
+    await state.set_state(Form.delete_menu)
+
+
+@dp.message(Form.delete_menu)
+async def delete_specific_record(message: Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await state.clear()
+        await message.answer("📋 Главное меню", reply_markup=main_menu())
+        return
+    
+    if message.text == "🗑 Удалить все записи":
+        async with pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM tasks WHERE user_id=$1", message.from_user.id)
+            if result == "DELETE 0":
+                await message.answer("📭 У вас нет записей для удаления", reply_markup=main_menu())
+            else:
+                await message.answer("🗑 Все записи удалены", reply_markup=main_menu())
+        await state.clear()
+        return
+    
+    # Удаляем конкретную запись
+    try:
+        # Извлекаем ID из текста кнопки (формат: "Тип (id:123)")
+        if "(id:" in message.text:
+            id_str = message.text.split("(id:")[1].split(")")[0]
+            record_id = int(id_str)
+            
+            async with pool.acquire() as conn:
+                # Проверяем, что запись принадлежит пользователю
+                record = await conn.fetchrow("SELECT * FROM tasks WHERE id=$1 AND user_id=$2", record_id, message.from_user.id)
+                if record:
+                    await conn.execute("DELETE FROM tasks WHERE id=$1", record_id)
+                    await message.answer(f"✅ Запись '{record['action_type']}' удалена", reply_markup=main_menu())
+                else:
+                    await message.answer("❌ Запись не найдена или не принадлежит вам", reply_markup=main_menu())
+        else:
+            await message.answer("❌ Не удалось определить запись", reply_markup=main_menu())
+        
+        await state.clear()
+        
+    except Exception as e:
+        logging.error(f"Error deleting record: {e}")
+        await message.answer("❌ Ошибка при удалении записи", reply_markup=main_menu())
+        await state.clear()
 
 
 @dp.message(F.text == "🗑 Удалить все записи")
 async def delete_all(message: Message):
-
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM tasks WHERE user_id=$1", message.from_user.id)
-
-    await message.answer("🗑 Все записи удалены", reply_markup=main_menu())
+        result = await conn.execute("DELETE FROM tasks WHERE user_id=$1", message.from_user.id)
+        if result == "DELETE 0":
+            await message.answer("📭 У вас нет записей для удаления", reply_markup=main_menu())
+        else:
+            await message.answer("🗑 Все записи удалены", reply_markup=main_menu())
 
 
 @dp.message(F.text == "❌ Удалиться из базы")
 async def delete_from_db(message: Message, state: FSMContext):
-
+    # Сначала удаляем все задачи пользователя
     async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM tasks WHERE user_id=$1", message.from_user.id)
         await conn.execute("DELETE FROM users WHERE tg_id=$1", message.from_user.id)
 
     await state.clear()
     await message.answer("❌ Вы удалены из базы", reply_markup=main_menu())
+
+
+@dp.message(F.text == "🔙 Назад")
+async def back_to_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📋 Главное меню", reply_markup=main_menu())
 
 
 # ================= START =================
